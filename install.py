@@ -18,10 +18,10 @@ import zipfile
 import importlib
 import configparser
 
-HOME_DIR   = "/home/container"
-BINS_ZIP   = os.path.join(HOME_DIR, "darkflame-bins.zip")
-BUILD_DIR  = os.path.join(HOME_DIR, "darkflame-build")
-SERVER_DIR = os.path.join(HOME_DIR, "DarkflameServer")
+HOME_DIR    = "/home/container"
+BINS_ZIP    = os.path.join(HOME_DIR, "darkflame-bins.zip")
+BUILD_DIR   = os.path.join(HOME_DIR, "darkflame-build")
+SERVER_DIR  = os.path.join(HOME_DIR, "DarkflameServer")
 CONFIG_FILE = os.path.join(HOME_DIR, "config_template.ini")
 
 BINARY_NAMES = {
@@ -32,7 +32,6 @@ BINARY_NAMES = {
 }
 
 def load_config():
-    """Charge la config depuis config_template.ini."""
     if not os.path.isfile(CONFIG_FILE):
         print(f"[!] ERREUR : {CONFIG_FILE} introuvable !")
         print("    Uploadez config_template.ini dans /home/container/")
@@ -55,6 +54,20 @@ def run(cmd, cwd=None, check=True):
 def has_sudo():
     result = subprocess.run("sudo -n true", shell=True, capture_output=True)
     return result.returncode == 0
+
+def setup_ld_library_path():
+    """Ajoute BUILD_DIR au LD_LIBRARY_PATH pour que libmariadbcpp.so soit trouvée."""
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    paths = [BUILD_DIR]
+    # Cherche aussi dans les sous-dossiers si la lib est dans un sous-répertoire
+    for root, dirs, files in os.walk(BUILD_DIR):
+        for f in files:
+            if f.endswith(".so") or ".so." in f:
+                paths.append(root)
+                break
+    new_path = ":".join(dict.fromkeys(paths)) + (":" + current if current else "")
+    os.environ["LD_LIBRARY_PATH"] = new_path
+    print(f"[=] LD_LIBRARY_PATH={new_path}")
 
 # ─── Mode binaires pré-compilés ──────────────────────────────────────────────
 
@@ -153,9 +166,8 @@ def test_db_connection(cfg):
         print("    Vérifiez config_template.ini (mysql_host, mysql_username, mysql_password, mysql_database).")
         sys.exit(1)
 
-def write_config(cfg):
+def write_config():
     print("\n[=] Écriture de la configuration dans le dossier build...")
-    # Relit le fichier brut pour copier tel quel dans le build
     raw = open(CONFIG_FILE).read()
     base_cfg = os.path.join(BUILD_DIR, "authconfig.ini")
     with open(base_cfg, "w") as f:
@@ -184,9 +196,10 @@ def start_server():
         print(f"[!] ERREUR : MasterServer introuvable dans {BUILD_DIR}")
         print("    → Uploadez darkflame-bins.zip dans /home/container/")
         sys.exit(1)
+    setup_ld_library_path()
     print(f"[✓] Lancement de {master}")
     os.chdir(BUILD_DIR)
-    os.execv(master, [master])
+    os.execve(master, [master], os.environ)
 
 # ─── Point d'entrée ──────────────────────────────────────────────────────────
 
@@ -208,7 +221,7 @@ def main():
 
     check_client_files(cfg)
     test_db_connection(cfg)
-    write_config(cfg)
+    write_config()
     start_server()
 
 if __name__ == "__main__":
