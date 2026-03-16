@@ -13,7 +13,6 @@ import configparser
 import urllib.request
 import tarfile
 
-# Auto-install pymysql et redémarre si absent
 try:
     import pymysql
 except ImportError:
@@ -37,13 +36,26 @@ BINARY_NAMES = {
     "world":  ["WorldServer",  "worldserver"],
 }
 
-# Packages Ubuntu 24.04 (Noble) contenant les libs GLIBC 2.38
-UBUNTU_MIRROR = "http://archive.ubuntu.com/ubuntu/pool/main"
+# URLs réelles Ubuntu 24.04 Noble - via security.ubuntu.com
+SECURITY_MIRROR = "http://security.ubuntu.com/ubuntu/pool/main"
+ARCHIVE_MIRROR  = "http://archive.ubuntu.com/ubuntu/pool/main"
+
 GLIBC_DEBS = [
-    f"{UBUNTU_MIRROR}/g/glibc/libc6_2.39-0ubuntu8.3_amd64.deb",
-    f"{UBUNTU_MIRROR}/g/gcc-14/libstdc++6_14.2.0-4ubuntu2~24.04_amd64.deb",
-    f"{UBUNTU_MIRROR}/g/gcc-14/libgcc-s1_14.2.0-4ubuntu2~24.04_amd64.deb",
+    # libc6 2.39 - version sécurité la plus récente
+    f"{SECURITY_MIRROR}/g/glibc/libc6_2.39-0ubuntu8.7_amd64.deb",
+    # libstdc++6 via gcc-14
+    f"{ARCHIVE_MIRROR}/g/gcc-14/libstdc++6_14-20240412-0ubuntu1_amd64.deb",
+    # libgcc-s1
+    f"{ARCHIVE_MIRROR}/g/gcc-14/libgcc-s1_14-20240412-0ubuntu1_amd64.deb",
 ]
+
+# Fallbacks si les URLs ci-dessus échouent
+GLIBC_DEBS_FALLBACK = [
+    f"{ARCHIVE_MIRROR}/g/glibc/libc6_2.39-0ubuntu8_amd64.deb",
+    f"{ARCHIVE_MIRROR}/g/gcc-13/libstdc++6_13.2.0-23ubuntu4_amd64.deb",
+    f"{ARCHIVE_MIRROR}/g/gcc-13/libgcc-s1_13.2.0-23ubuntu4_amd64.deb",
+]
+
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
 def load_config():
@@ -78,42 +90,15 @@ def needs_glibc_compat():
 
 def download_file(url, dest):
     print(f"[=] Téléchargement {url.split('/')[-1]}...")
-    urllib.request.urlretrieve(url, dest)
-
-def extract_deb_libs(deb_path, out_dir):
-    """Extrait les .so d'un .deb Ubuntu sans dpkg (utilise ar + tar)."""
-    work = deb_path + ".work"
-    os.makedirs(work, exist_ok=True)
-    # ar x le .deb
-    r = subprocess.run(["ar", "x", deb_path], cwd=work, capture_output=True)
-    if r.returncode != 0:
-        # ar non dispo, essai via Python
-        print("[!] ar non disponible, extraction manuelle...")
-        _extract_deb_python(deb_path, work)
-    # Trouver data.tar.*
-    data_tar = None
-    for f in os.listdir(work):
-        if f.startswith("data.tar"):
-            data_tar = os.path.join(work, f)
-            break
-    if data_tar is None:
-        print(f"[!] data.tar introuvable dans {deb_path}")
-        return
-    with tarfile.open(data_tar) as t:
-        for m in t.getmembers():
-            if ".so" in m.name and (m.name.endswith(".so") or ".so." in m.name):
-                m.name = os.path.basename(m.name)
-                try:
-                    t.extract(m, out_dir)
-                except Exception:
-                    pass
-    shutil.rmtree(work, ignore_errors=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r, open(dest, 'wb') as f:
+        shutil.copyfileobj(r, f)
 
 def _extract_deb_python(deb_path, work_dir):
-    """Extraction .deb basique via lecture ar format."""
+    """Extraction .deb via format ar en pur Python."""
     with open(deb_path, 'rb') as f:
-        magic = f.read(8)
-        if magic != b'!<arch>\n':
+        if f.read(8) != b'!<arch>\n':
+            print(f"[!] {deb_path} n'est pas un .deb valide")
             return
         while True:
             header = f.read(60)
@@ -125,13 +110,47 @@ def _extract_deb_python(deb_path, work_dir):
             if size % 2 == 1:
                 f.read(1)
             if name.startswith('data.tar'):
-                ext = name
-                out = os.path.join(work_dir, ext)
+                out = os.path.join(work_dir, name)
                 with open(out, 'wb') as g:
                     g.write(data)
+                break
+
+def extract_deb_libs(deb_path, out_dir):
+    work = deb_path + ".work"
+    os.makedirs(work, exist_ok=True)
+    r = subprocess.run(["ar", "x", deb_path], cwd=work, capture_output=True)
+    if r.returncode != 0:
+        print("[!] ar non dispo, extraction Python...")
+        _extract_deb_python(deb_path, work)
+    data_tar = next((os.path.join(work, f) for f in os.listdir(work) if f.startswith("data.tar")), None)
+    if data_tar is None:
+        print(f"[!] data.tar introuvable dans {os.path.basename(deb_path)}")
+        shutil.rmtree(work, ignore_errors=True)
+        return
+    with tarfile.open(data_tar) as t:
+        for m in t.getmembers():
+            if ".so" in m.name:
+                m.name = os.path.basename(m.name)
+                try:
+                    t.extract(m, out_dir)
+                except Exception:
+                    pass
+    shutil.rmtree(work, ignore_errors=True)
+
+def try_download_debs(urls, tmp_dir, out_dir):
+    success = 0
+    for url in urls:
+        deb = os.path.join(tmp_dir, url.split('/')[-1])
+        try:
+            download_file(url, deb)
+            extract_deb_libs(deb, out_dir)
+            success += 1
+        except Exception as e:
+            print(f"[!] Erreur sur {url.split('/')[-1]}: {e}")
+    return success
 
 def setup_glibc_compat():
-    if os.path.isdir(GLIBC_DIR) and any(f.endswith('.so.6') for f in os.listdir(GLIBC_DIR)):
+    if os.path.isdir(GLIBC_DIR) and any('libc' in f for f in os.listdir(GLIBC_DIR)):
         print("[✓] GLIBC compat déjà présent, skip.")
         return
 
@@ -140,25 +159,20 @@ def setup_glibc_compat():
     tmp = os.path.join(HOME_DIR, "glibc-tmp")
     os.makedirs(tmp, exist_ok=True)
 
-    # Télécharger et extraire chaque .deb
-    for url in GLIBC_DEBS:
-        deb = os.path.join(tmp, url.split('/')[-1])
-        try:
-            download_file(url, deb)
-            extract_deb_libs(deb, GLIBC_DIR)
-        except Exception as e:
-            print(f"[!] Erreur sur {url}: {e}")
+    print("[=] Tentative avec les URLs principales...")
+    ok = try_download_debs(GLIBC_DEBS, tmp, GLIBC_DIR)
+    if ok == 0 or not any('libc' in f for f in os.listdir(GLIBC_DIR)):
+        print("[=] URLs principales échouées, tentative fallback...")
+        try_download_debs(GLIBC_DEBS_FALLBACK, tmp, GLIBC_DIR)
 
     shutil.rmtree(tmp, ignore_errors=True)
 
-    # Vérifier qu'on a bien libc.so.6
     libs = os.listdir(GLIBC_DIR)
     print(f"[=] Libs extraites : {libs}")
     if not any('libc' in f for f in libs):
         print("[!] ERREUR : libc.so.6 non trouvé après extraction")
         sys.exit(1)
 
-    # Télécharger patchelf
     if not os.path.isfile(PATCHELF):
         print("[=] Téléchargement patchelf...")
         tar = os.path.join(HOME_DIR, "patchelf.tar.gz")
@@ -172,15 +186,11 @@ def setup_glibc_compat():
         os.chmod(PATCHELF, 0o755)
         os.remove(tar)
 
-    # Trouver ld-linux
-    ld = next((os.path.join(GLIBC_DIR, f) for f in os.listdir(GLIBC_DIR)
-               if f.startswith("ld-linux") or f.startswith("ld-")), None)
-    if ld is None:
-        # ld-linux est souvent dans libc6 sous un nom versiotné
-        for f in os.listdir(GLIBC_DIR):
-            if 'ld' in f and '.so' in f:
-                ld = os.path.join(GLIBC_DIR, f)
-                break
+    ld = next(
+        (os.path.join(GLIBC_DIR, f) for f in os.listdir(GLIBC_DIR)
+         if f.startswith("ld-linux") or ("ld" in f and ".so" in f)),
+        None
+    )
     if ld is None:
         print(f"[!] ld-linux introuvable dans {GLIBC_DIR}")
         sys.exit(1)
@@ -210,8 +220,6 @@ def setup_ld_library_path():
     os.environ["LD_LIBRARY_PATH"] = new_path
     print(f"[=] LD_LIBRARY_PATH={new_path}")
 
-# ─── Mode binaires pré-compilés ───────────────────────────────────────────
-
 def extract_prebuilt():
     print("\n[=] darkflame-bins.zip détecté → mode binaires pré-compilés")
     if find_binary("master") is not None:
@@ -236,8 +244,6 @@ def install_runtime_deps():
         print("[!] apt-get indisponible, on continue.")
         return
     subprocess.run(f"{apt} install -y libmariadb3 libssl3 unzip binutils", shell=True)
-
-# ─── Mode compilation ───────────────────────────────────────────────
 
 def install_build_deps():
     apt = "sudo apt-get" if has_sudo() else "apt-get"
@@ -267,8 +273,6 @@ def build_server():
             if os.path.isdir(p): shutil.rmtree(p, ignore_errors=True)
             elif item.endswith((".o", ".a", ".cmake")): os.remove(p)
     shutil.rmtree(SERVER_DIR, ignore_errors=True)
-
-# ─── Commun ───────────────────────────────────────────────────────────────
 
 def test_db_connection(cfg):
     print("\n[=] Test de connexion à la base de données...")
@@ -324,15 +328,11 @@ def start_server():
     os.chdir(BUILD_DIR)
     os.execve(master, [master], os.environ)
 
-# ─── Point d'entrée ────────────────────────────────────────────────────────
-
 def main():
     print("===================================================")
     print(" Darkflame Universe - Pterodactyl Python Container")
     print("===================================================")
-
     cfg = load_config()
-
     if os.path.isfile(BINS_ZIP):
         install_runtime_deps()
         extract_prebuilt()
@@ -341,7 +341,6 @@ def main():
         install_build_deps()
         clone_server()
         build_server()
-
     check_client_files(cfg)
     test_db_connection(cfg)
     write_config()
