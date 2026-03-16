@@ -6,6 +6,8 @@ pour container Python Pterodactyl avec DB externe
 Modes :
   - Mode BINAIRES : si /home/container/darkflame-bins.zip existe → skip compilation
   - Mode COMPILATION : sinon → clone + compile depuis les sources (nécessite sudo)
+
+Configuration : /home/container/config_template.ini
 """
 
 import os
@@ -14,19 +16,13 @@ import sys
 import shutil
 import zipfile
 import importlib
-
-# ─── Variables d'environnement ───────────────────────────────────────────────
-MYSQL_HOST     = os.environ.get("MYSQL_HOST", "127.0.0.1")
-MYSQL_PORT     = int(os.environ.get("MYSQL_PORT", "3306"))
-MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "darkflame")
-MYSQL_USER     = os.environ.get("MYSQL_USER", "dlu_user")
-MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
-CLIENT_PATH    = os.environ.get("CLIENT_PATH", "/home/container/client")
+import configparser
 
 HOME_DIR   = "/home/container"
 BINS_ZIP   = os.path.join(HOME_DIR, "darkflame-bins.zip")
 BUILD_DIR  = os.path.join(HOME_DIR, "darkflame-build")
 SERVER_DIR = os.path.join(HOME_DIR, "DarkflameServer")
+CONFIG_FILE = os.path.join(HOME_DIR, "config_template.ini")
 
 BINARY_NAMES = {
     "master": ["MasterServer", "masterserver"],
@@ -34,6 +30,16 @@ BINARY_NAMES = {
     "chat":   ["ChatServer",   "chatserver"],
     "world":  ["WorldServer",  "worldserver"],
 }
+
+def load_config():
+    """Charge la config depuis config_template.ini."""
+    if not os.path.isfile(CONFIG_FILE):
+        print(f"[!] ERREUR : {CONFIG_FILE} introuvable !")
+        print("    Uploadez config_template.ini dans /home/container/")
+        sys.exit(1)
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG_FILE)
+    return cfg
 
 def find_binary(name_key):
     for name in BINARY_NAMES[name_key]:
@@ -114,69 +120,62 @@ def build_server():
 # ─── Commun ──────────────────────────────────────────────────────────────────
 
 def ensure_pymysql():
-    """Installe pymysql dans le bon chemin Python et l'importe."""
     try:
         import pymysql
         return pymysql
     except ImportError:
         pass
     print("[=] Installation de pymysql...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "pymysql", "-q"],
-        check=True
-    )
-    # Forcer Python à recharger les chemins
+    subprocess.run([sys.executable, "-m", "pip", "install", "pymysql", "-q"], check=True)
     importlib.invalidate_caches()
     import pymysql
     return pymysql
 
-def test_db_connection():
+def test_db_connection(cfg):
     print("\n[=] Test de connexion à la base de données...")
     pymysql = ensure_pymysql()
+    host     = cfg.get("Database", "mysql_host")
+    port     = int(cfg.get("Database", "mysql_port", fallback="3306"))
+    database = cfg.get("Database", "mysql_database")
+    user     = cfg.get("Database", "mysql_username")
+    password = cfg.get("Database", "mysql_password")
+    print(f"[=] Connexion à {user}@{host}:{port}/{database}")
     try:
         conn = pymysql.connect(
-            host=MYSQL_HOST,
-            port=MYSQL_PORT,
-            user=MYSQL_USER,
-            password=MYSQL_PASSWORD,
-            database=MYSQL_DATABASE,
+            host=host, port=port, user=user,
+            password=password, database=database,
             connect_timeout=10
         )
         conn.close()
         print("[✓] Connexion DB réussie !")
     except Exception as e:
         print(f"[!] ERREUR connexion DB : {e}")
-        print("    Vérifiez MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE.")
+        print("    Vérifiez config_template.ini (mysql_host, mysql_username, mysql_password, mysql_database).")
         sys.exit(1)
 
-def write_config():
-    print("\n[=] Écriture de la configuration...")
-    template_path = os.path.join(HOME_DIR, "config_template.ini")
-    config_content = open(template_path).read() \
-        .replace("{{MYSQL_HOST}}",     MYSQL_HOST) \
-        .replace("{{MYSQL_PORT}}",     str(MYSQL_PORT)) \
-        .replace("{{MYSQL_DATABASE}}", MYSQL_DATABASE) \
-        .replace("{{MYSQL_USER}}",     MYSQL_USER) \
-        .replace("{{MYSQL_PASSWORD}}", MYSQL_PASSWORD) \
-        .replace("{{CLIENT_PATH}}",    CLIENT_PATH)
+def write_config(cfg):
+    print("\n[=] Écriture de la configuration dans le dossier build...")
+    # Relit le fichier brut pour copier tel quel dans le build
+    raw = open(CONFIG_FILE).read()
     base_cfg = os.path.join(BUILD_DIR, "authconfig.ini")
     with open(base_cfg, "w") as f:
-        f.write(config_content)
-    for cfg in ["masterconfig.ini", "worldconfig.ini", "chatconfig.ini"]:
-        shutil.copy(base_cfg, os.path.join(BUILD_DIR, cfg))
+        f.write(raw)
+    for c in ["masterconfig.ini", "worldconfig.ini", "chatconfig.ini"]:
+        shutil.copy(base_cfg, os.path.join(BUILD_DIR, c))
     print("[✓] Configs écrites.")
 
-def check_client_files():
+def check_client_files(cfg):
     print("\n[=] Vérification des fichiers client...")
-    if not os.path.isdir(CLIENT_PATH):
-        print(f"[!] ERREUR : fichiers client introuvables à {CLIENT_PATH}")
+    client_path = cfg.get("General", "client_location", fallback="/home/container/client")
+    if not os.path.isdir(client_path):
+        print(f"[!] ERREUR : fichiers client introuvables à {client_path}")
         sys.exit(1)
     required = ["res/cdclient.fdb", "locale/locale.xml"]
-    missing = [f for f in required if not os.path.isfile(os.path.join(CLIENT_PATH, f))]
+    missing = [f for f in required if not os.path.isfile(os.path.join(client_path, f))]
     if missing:
         print(f"[!] Fichiers client manquants : {', '.join(missing)}")
         sys.exit(1)
-    print(f"[✓] Fichiers client OK à {CLIENT_PATH}")
+    print(f"[✓] Fichiers client OK à {client_path}")
 
 def start_server():
     print("\n[=] Démarrage de Darkflame Universe...")
@@ -196,6 +195,8 @@ def main():
     print(" Darkflame Universe - Pterodactyl Python Container")
     print("===================================================")
 
+    cfg = load_config()
+
     if os.path.isfile(BINS_ZIP):
         install_runtime_deps()
         extract_prebuilt()
@@ -205,9 +206,9 @@ def main():
         clone_server()
         build_server()
 
-    check_client_files()
-    test_db_connection()
-    write_config()
+    check_client_files(cfg)
+    test_db_connection(cfg)
+    write_config(cfg)
     start_server()
 
 if __name__ == "__main__":
