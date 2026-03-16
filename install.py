@@ -16,7 +16,7 @@ import zipfile
 
 # ─── Variables d'environnement ───────────────────────────────────────────────
 MYSQL_HOST     = os.environ.get("MYSQL_HOST", "127.0.0.1")
-MYSQL_PORT     = os.environ.get("MYSQL_PORT", "3306")
+MYSQL_PORT     = int(os.environ.get("MYSQL_PORT", "3306"))
 MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "darkflame")
 MYSQL_USER     = os.environ.get("MYSQL_USER", "dlu_user")
 MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
@@ -36,7 +36,6 @@ BINARY_NAMES = {
 }
 
 def find_binary(name_key):
-    """Retourne le chemin du binaire trouvé (majuscule ou minuscule)."""
     for name in BINARY_NAMES[name_key]:
         path = os.path.join(BUILD_DIR, name)
         if os.path.isfile(path):
@@ -62,7 +61,6 @@ def extract_prebuilt():
     os.makedirs(BUILD_DIR, exist_ok=True)
     with zipfile.ZipFile(BINS_ZIP, 'r') as z:
         z.extractall(BUILD_DIR)
-    # Rendre tous les binaires exécutables
     for key in BINARY_NAMES:
         for name in BINARY_NAMES[key]:
             p = os.path.join(BUILD_DIR, name)
@@ -71,13 +69,13 @@ def extract_prebuilt():
     print("[✓] Binaires extraits dans", BUILD_DIR)
 
 def install_runtime_deps():
-    print("\n[=] Installation des dépendances runtime...")
+    print("\n[=] Vérification des dépendances runtime...")
     apt = "sudo apt-get" if has_sudo() else "apt-get"
     r = subprocess.run(f"{apt} update -qq", shell=True)
     if r.returncode != 0:
-        print("[!] apt-get update échoué (pas de droits ?). On continue, les libs sont peut-être déjà présentes.")
+        print("[!] apt-get indisponible, on continue (libs peut-être déjà présentes).")
         return
-    subprocess.run(f"{apt} install -y libmariadb3 libssl3 default-mysql-client unzip", shell=True)
+    subprocess.run(f"{apt} install -y libmariadb3 libssl3 unzip", shell=True)
 
 # ─── Mode compilation depuis les sources ─────────────────────────────────────
 
@@ -89,7 +87,7 @@ def install_build_deps():
         print("[!] ERREUR : impossible d'installer les dépendances (pas de droits sudo).")
         print("    → Uploadez darkflame-bins.zip pour utiliser le mode binaires pré-compilés.")
         sys.exit(1)
-    run(f"{apt} install -y git cmake g++ zlib1g-dev libssl-dev libmariadb-dev-compat libmariadb-dev default-mysql-client unzip")
+    run(f"{apt} install -y git cmake g++ zlib1g-dev libssl-dev libmariadb-dev-compat libmariadb-dev unzip")
 
 def clone_server():
     if os.path.exists(SERVER_DIR):
@@ -121,12 +119,46 @@ def build_server():
 
 # ─── Commun ──────────────────────────────────────────────────────────────────
 
+def install_pymysql():
+    """Installe pymysql via pip (pas besoin de sudo)."""
+    r = subprocess.run("pip install pymysql -q", shell=True)
+    if r.returncode != 0:
+        print("[!] Impossible d'installer pymysql via pip.")
+        return False
+    return True
+
+def test_db_connection():
+    print("\n[=] Test de connexion à la base de données...")
+    try:
+        import pymysql
+    except ImportError:
+        print("[=] pymysql non trouvé, installation...")
+        if not install_pymysql():
+            print("[!] Skip test DB (pymysql indisponible).")
+            return
+        import pymysql
+    try:
+        conn = pymysql.connect(
+            host=MYSQL_HOST,
+            port=MYSQL_PORT,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE,
+            connect_timeout=10
+        )
+        conn.close()
+        print("[✓] Connexion DB réussie !")
+    except Exception as e:
+        print(f"[!] ERREUR connexion DB : {e}")
+        print("    Vérifiez MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE.")
+        sys.exit(1)
+
 def write_config():
     print("\n[=] Écriture de la configuration...")
     template_path = os.path.join(HOME_DIR, "config_template.ini")
     config_content = open(template_path).read() \
         .replace("{{MYSQL_HOST}}",     MYSQL_HOST) \
-        .replace("{{MYSQL_PORT}}",     MYSQL_PORT) \
+        .replace("{{MYSQL_PORT}}",     str(MYSQL_PORT)) \
         .replace("{{MYSQL_DATABASE}}", MYSQL_DATABASE) \
         .replace("{{MYSQL_USER}}",     MYSQL_USER) \
         .replace("{{MYSQL_PASSWORD}}", MYSQL_PASSWORD) \
@@ -149,22 +181,6 @@ def check_client_files():
         print(f"[!] Fichiers client manquants : {', '.join(missing)}")
         sys.exit(1)
     print(f"[✓] Fichiers client OK à {CLIENT_PATH}")
-
-def test_db_connection():
-    print("\n[=] Test de connexion à la base de données...")
-    try:
-        result = subprocess.run(
-            f"mysql -h {MYSQL_HOST} -P {MYSQL_PORT} -u {MYSQL_USER} -p{MYSQL_PASSWORD} -e 'SELECT 1;' {MYSQL_DATABASE}",
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            print("[✓] Connexion DB réussie !")
-        else:
-            print(f"[!] ERREUR connexion DB : {result.stderr.strip()}")
-            sys.exit(1)
-    except subprocess.TimeoutExpired:
-        print("[!] Timeout connexion DB. Vérifiez MYSQL_HOST et le firewall.")
-        sys.exit(1)
 
 def start_server():
     print("\n[=] Démarrage de Darkflame Universe...")
