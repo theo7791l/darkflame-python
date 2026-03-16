@@ -13,12 +13,21 @@ import configparser
 import urllib.request
 import tarfile
 
+def pip_install(pkg):
+    subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
+
 try:
     import pymysql
 except ImportError:
     print("[=] Installation de pymysql...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "pymysql", "-q"], check=True)
-    print("[=] Redémarrage du script...")
+    pip_install("pymysql")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+try:
+    import zstandard as zstd
+except ImportError:
+    print("[=] Installation de zstandard...")
+    pip_install("zstandard")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 HOME_DIR    = "/home/container"
@@ -36,24 +45,12 @@ BINARY_NAMES = {
     "world":  ["WorldServer",  "worldserver"],
 }
 
-# URLs réelles Ubuntu 24.04 Noble - via security.ubuntu.com
-SECURITY_MIRROR = "http://security.ubuntu.com/ubuntu/pool/main"
-ARCHIVE_MIRROR  = "http://archive.ubuntu.com/ubuntu/pool/main"
-
+# URLs réelles vérifiées sur packages.ubuntu.com Noble
+SEC = "http://security.ubuntu.com/ubuntu/pool/main"
 GLIBC_DEBS = [
-    # libc6 2.39 - version sécurité la plus récente
-    f"{SECURITY_MIRROR}/g/glibc/libc6_2.39-0ubuntu8.7_amd64.deb",
-    # libstdc++6 via gcc-14
-    f"{ARCHIVE_MIRROR}/g/gcc-14/libstdc++6_14-20240412-0ubuntu1_amd64.deb",
-    # libgcc-s1
-    f"{ARCHIVE_MIRROR}/g/gcc-14/libgcc-s1_14-20240412-0ubuntu1_amd64.deb",
-]
-
-# Fallbacks si les URLs ci-dessus échouent
-GLIBC_DEBS_FALLBACK = [
-    f"{ARCHIVE_MIRROR}/g/glibc/libc6_2.39-0ubuntu8_amd64.deb",
-    f"{ARCHIVE_MIRROR}/g/gcc-13/libstdc++6_13.2.0-23ubuntu4_amd64.deb",
-    f"{ARCHIVE_MIRROR}/g/gcc-13/libgcc-s1_13.2.0-23ubuntu4_amd64.deb",
+    f"{SEC}/g/glibc/libc6_2.39-0ubuntu8.7_amd64.deb",
+    f"{SEC}/g/gcc-14/libstdc++6_14.2.0-4ubuntu2~24.04.1_amd64.deb",
+    f"{SEC}/g/gcc-14/libgcc-s1_14.2.0-4ubuntu2~24.04.1_amd64.deb",
 ]
 
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
@@ -90,16 +87,32 @@ def needs_glibc_compat():
 
 def download_file(url, dest):
     print(f"[=] Téléchargement {url.split('/')[-1]}...")
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as r, open(dest, 'wb') as f:
+    req = urllib.request.Request(url, headers={"User-Agent": "Wget/1.21"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest, 'wb') as f:
         shutil.copyfileobj(r, f)
 
-def _extract_deb_python(deb_path, work_dir):
-    """Extraction .deb via format ar en pur Python."""
+def extract_tar_zst(zst_path, out_dir):
+    """Extrait un data.tar.zst avec le module zstandard."""
+    import io
+    dctx = zstd.ZstdDecompressor()
+    with open(zst_path, 'rb') as f:
+        with dctx.stream_reader(f) as reader:
+            tar_bytes = reader.read()
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as t:
+        for m in t.getmembers():
+            if ".so" in m.name:
+                m.name = os.path.basename(m.name)
+                try:
+                    t.extract(m, out_dir)
+                except Exception:
+                    pass
+
+def _extract_deb_ar(deb_path, work_dir):
+    """Extrait le data.tar.* d'un .deb via format ar en pur Python."""
     with open(deb_path, 'rb') as f:
         if f.read(8) != b'!<arch>\n':
-            print(f"[!] {deb_path} n'est pas un .deb valide")
-            return
+            print(f"[!] {os.path.basename(deb_path)} n'est pas un .deb valide")
+            return None
         while True:
             header = f.read(60)
             if len(header) < 60:
@@ -113,41 +126,40 @@ def _extract_deb_python(deb_path, work_dir):
                 out = os.path.join(work_dir, name)
                 with open(out, 'wb') as g:
                     g.write(data)
-                break
+                return out
+    return None
 
 def extract_deb_libs(deb_path, out_dir):
     work = deb_path + ".work"
     os.makedirs(work, exist_ok=True)
+
+    # Essai avec ar
     r = subprocess.run(["ar", "x", deb_path], cwd=work, capture_output=True)
     if r.returncode != 0:
-        print("[!] ar non dispo, extraction Python...")
-        _extract_deb_python(deb_path, work)
-    data_tar = next((os.path.join(work, f) for f in os.listdir(work) if f.startswith("data.tar")), None)
+        data_tar = _extract_deb_ar(deb_path, work)
+    else:
+        data_tar = next((os.path.join(work, f) for f in os.listdir(work)
+                         if f.startswith("data.tar")), None)
+
     if data_tar is None:
         print(f"[!] data.tar introuvable dans {os.path.basename(deb_path)}")
         shutil.rmtree(work, ignore_errors=True)
         return
-    with tarfile.open(data_tar) as t:
-        for m in t.getmembers():
-            if ".so" in m.name:
-                m.name = os.path.basename(m.name)
-                try:
-                    t.extract(m, out_dir)
-                except Exception:
-                    pass
-    shutil.rmtree(work, ignore_errors=True)
 
-def try_download_debs(urls, tmp_dir, out_dir):
-    success = 0
-    for url in urls:
-        deb = os.path.join(tmp_dir, url.split('/')[-1])
-        try:
-            download_file(url, deb)
-            extract_deb_libs(deb, out_dir)
-            success += 1
-        except Exception as e:
-            print(f"[!] Erreur sur {url.split('/')[-1]}: {e}")
-    return success
+    print(f"[=] Extraction {os.path.basename(data_tar)}...")
+    if data_tar.endswith(".zst"):
+        extract_tar_zst(data_tar, out_dir)
+    else:
+        with tarfile.open(data_tar) as t:
+            for m in t.getmembers():
+                if ".so" in m.name:
+                    m.name = os.path.basename(m.name)
+                    try:
+                        t.extract(m, out_dir)
+                    except Exception:
+                        pass
+
+    shutil.rmtree(work, ignore_errors=True)
 
 def setup_glibc_compat():
     if os.path.isdir(GLIBC_DIR) and any('libc' in f for f in os.listdir(GLIBC_DIR)):
@@ -159,11 +171,13 @@ def setup_glibc_compat():
     tmp = os.path.join(HOME_DIR, "glibc-tmp")
     os.makedirs(tmp, exist_ok=True)
 
-    print("[=] Tentative avec les URLs principales...")
-    ok = try_download_debs(GLIBC_DEBS, tmp, GLIBC_DIR)
-    if ok == 0 or not any('libc' in f for f in os.listdir(GLIBC_DIR)):
-        print("[=] URLs principales échouées, tentative fallback...")
-        try_download_debs(GLIBC_DEBS_FALLBACK, tmp, GLIBC_DIR)
+    for url in GLIBC_DEBS:
+        deb = os.path.join(tmp, url.split('/')[-1])
+        try:
+            download_file(url, deb)
+            extract_deb_libs(deb, GLIBC_DIR)
+        except Exception as e:
+            print(f"[!] Erreur sur {url.split('/')[-1]}: {e}")
 
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -173,6 +187,7 @@ def setup_glibc_compat():
         print("[!] ERREUR : libc.so.6 non trouvé après extraction")
         sys.exit(1)
 
+    # patchelf
     if not os.path.isfile(PATCHELF):
         print("[=] Téléchargement patchelf...")
         tar = os.path.join(HOME_DIR, "patchelf.tar.gz")
@@ -188,11 +203,11 @@ def setup_glibc_compat():
 
     ld = next(
         (os.path.join(GLIBC_DIR, f) for f in os.listdir(GLIBC_DIR)
-         if f.startswith("ld-linux") or ("ld" in f and ".so" in f)),
+         if f.startswith("ld-linux") or ("ld-" in f and ".so" in f)),
         None
     )
     if ld is None:
-        print(f"[!] ld-linux introuvable dans {GLIBC_DIR}")
+        print(f"[!] ld-linux introuvable dans {GLIBC_DIR}: {libs}")
         sys.exit(1)
     os.chmod(ld, 0o755)
 
