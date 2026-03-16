@@ -10,6 +10,9 @@ import sys
 import shutil
 import zipfile
 import configparser
+import urllib.request
+import tarfile
+import stat
 
 # Auto-install pymysql et redémarre si absent
 try:
@@ -25,6 +28,12 @@ BINS_ZIP    = os.path.join(HOME_DIR, "darkflame-bins.zip")
 BUILD_DIR   = os.path.join(HOME_DIR, "darkflame-build")
 SERVER_DIR  = os.path.join(HOME_DIR, "DarkflameServer")
 CONFIG_FILE = os.path.join(HOME_DIR, "config_template.ini")
+GLIBC_DIR   = os.path.join(HOME_DIR, "glibc-compat")
+
+# URL d'un GLIBC 2.38 portable (prebuilt, pas de compilation)
+GLIBC_URL = "https://github.com/wheybags/glibc_version_header/releases/download/2.38/glibc-2.38-linux-x86_64.tar.gz"
+# Fallback : utiliser les libs d'un container Ubuntu 24.04 via un tar prépackagé
+GLIBC_LIBS_URL = "https://github.com/theo7791l/darkflame-python/releases/download/glibc-compat/glibc-2.38-libs.tar.gz"
 
 BINARY_NAMES = {
     "master": ["MasterServer", "masterserver"],
@@ -55,8 +64,78 @@ def run(cmd, cwd=None, check=True):
 def has_sudo():
     return subprocess.run("sudo -n true", shell=True, capture_output=True).returncode == 0
 
+def needs_glibc_compat():
+    """Vérifie si les binaires nécessitent GLIBC_2.38 non dispo dans le container."""
+    master = find_binary("master")
+    if master is None:
+        return False
+    r = subprocess.run(["ldd", master], capture_output=True, text=True)
+    return "GLIBC_2.38" in r.stdout or "GLIBC_2.38" in r.stderr or "not found" in r.stdout
+
+def setup_glibc_compat():
+    """Télécharge les libs GLIBC 2.38 portables et patche les binaires avec patchelf."""
+    if os.path.isdir(GLIBC_DIR) and os.listdir(GLIBC_DIR):
+        print("[✓] GLIBC compat déjà présent, skip.")
+        return
+
+    print("[=] GLIBC_2.38 requis mais absent → téléchargement des libs compatibles...")
+    os.makedirs(GLIBC_DIR, exist_ok=True)
+
+    # Télécharger patchelf
+    patchelf_bin = os.path.join(HOME_DIR, "patchelf")
+    if not os.path.isfile(patchelf_bin):
+        print("[=] Téléchargement de patchelf...")
+        patchelf_url = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
+        patchelf_tar = os.path.join(HOME_DIR, "patchelf.tar.gz")
+        urllib.request.urlretrieve(patchelf_url, patchelf_tar)
+        with tarfile.open(patchelf_tar) as t:
+            for m in t.getmembers():
+                if m.name.endswith("patchelf"):
+                    m.name = "patchelf"
+                    t.extract(m, HOME_DIR)
+                    break
+        os.chmod(patchelf_bin, 0o755)
+        os.remove(patchelf_tar)
+        print("[✓] patchelf prêt.")
+
+    # Télécharger les libs GLIBC 2.38
+    libs_tar = os.path.join(HOME_DIR, "glibc-libs.tar.gz")
+    if not os.path.isfile(libs_tar):
+        print("[=] Téléchargement des libs GLIBC 2.38...")
+        try:
+            urllib.request.urlretrieve(GLIBC_LIBS_URL, libs_tar)
+            with tarfile.open(libs_tar) as t:
+                t.extractall(GLIBC_DIR)
+            os.remove(libs_tar)
+            print("[✓] Libs GLIBC 2.38 extraites.")
+        except Exception as e:
+            print(f"[!] Impossible de télécharger les libs GLIBC : {e}")
+            print("[!] Upload glibc-2.38-libs.tar.gz dans le container ou recompile les binaires sur Debian 12.")
+            sys.exit(1)
+
+    # Patcher chaque binaire
+    ld_path = None
+    for f in os.listdir(GLIBC_DIR):
+        if f.startswith("ld-linux") or f.startswith("ld-"):
+            ld_path = os.path.join(GLIBC_DIR, f)
+            break
+
+    if ld_path is None:
+        print(f"[!] ld-linux introuvable dans {GLIBC_DIR}")
+        sys.exit(1)
+
+    os.chmod(ld_path, 0o755)
+
+    for key in BINARY_NAMES:
+        b = find_binary(key)
+        if b:
+            print(f"[=] Patch {b}...")
+            run(f"{patchelf_bin} --set-interpreter {ld_path} --set-rpath {GLIBC_DIR}:{BUILD_DIR}/thirdparty/mariadb-connector-cpp/src/mariadb_connector_cpp-build {b}")
+
+    print("[✓] Binaires patchés pour GLIBC 2.38.")
+
 def setup_ld_library_path():
-    paths = [BUILD_DIR]
+    paths = [BUILD_DIR, GLIBC_DIR]
     for root, dirs, files in os.walk(BUILD_DIR):
         for f in files:
             if f.endswith(".so") or ".so." in f:
@@ -94,7 +173,7 @@ def install_runtime_deps():
         return
     subprocess.run(f"{apt} install -y libmariadb3 libssl3 unzip", shell=True)
 
-# ─── Mode compilation ───────────────────────────────────────────────────────────
+# ─── Mode compilation ────────────────────────────────────────────────────────
 
 def install_build_deps():
     apt = "sudo apt-get" if has_sudo() else "apt-get"
@@ -161,7 +240,7 @@ def check_client_files(cfg):
     if not os.path.isdir(client_path):
         print(f"[!] ERREUR : client introuvable à {client_path}")
         sys.exit(1)
-    required = ["res/cdclient.fdb", "locale/locale.xml"]
+    required = ["res/cdclient.fdb", "locale/locale.xml")
     missing = [f for f in required if not os.path.isfile(os.path.join(client_path, f))]
     if missing:
         print(f"[!] Fichiers client manquants : {', '.join(missing)}")
@@ -174,6 +253,8 @@ def start_server():
     if master is None:
         print(f"[!] ERREUR : MasterServer introuvable dans {BUILD_DIR}")
         sys.exit(1)
+    if needs_glibc_compat():
+        setup_glibc_compat()
     setup_ld_library_path()
     print(f"[✓] Lancement de {master}")
     os.chdir(BUILD_DIR)
