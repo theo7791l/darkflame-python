@@ -27,6 +27,22 @@ BINS_ZIP   = os.path.join(HOME_DIR, "darkflame-bins.zip")
 BUILD_DIR  = os.path.join(HOME_DIR, "darkflame-build")
 SERVER_DIR = os.path.join(HOME_DIR, "DarkflameServer")
 
+# Noms possibles des binaires (avec ou sans majuscule selon la version compilée)
+BINARY_NAMES = {
+    "master": ["MasterServer", "masterserver"],
+    "auth":   ["AuthServer",   "authserver"],
+    "chat":   ["ChatServer",   "chatserver"],
+    "world":  ["WorldServer",  "worldserver"],
+}
+
+def find_binary(name_key):
+    """Retourne le chemin du binaire trouvé (majuscule ou minuscule)."""
+    for name in BINARY_NAMES[name_key]:
+        path = os.path.join(BUILD_DIR, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
 def run(cmd, cwd=None, check=True):
     print(f"[+] {cmd}")
     return subprocess.run(cmd, shell=True, cwd=cwd, check=check)
@@ -39,27 +55,27 @@ def has_sudo():
 
 def extract_prebuilt():
     print("\n[=] darkflame-bins.zip détecté → mode binaires pré-compilés")
-    if os.path.exists(BUILD_DIR) and os.path.isfile(os.path.join(BUILD_DIR, "masterserver")):
+    if find_binary("master") is not None:
         print("[✓] Binaires déjà extraits, skip.")
         return
     print("[=] Extraction des binaires...")
     os.makedirs(BUILD_DIR, exist_ok=True)
     with zipfile.ZipFile(BINS_ZIP, 'r') as z:
         z.extractall(BUILD_DIR)
-    for binary in ["masterserver", "authserver", "chatserver", "worldserver"]:
-        bin_path = os.path.join(BUILD_DIR, binary)
-        if os.path.isfile(bin_path):
-            os.chmod(bin_path, 0o755)
+    # Rendre tous les binaires exécutables
+    for key in BINARY_NAMES:
+        for name in BINARY_NAMES[key]:
+            p = os.path.join(BUILD_DIR, name)
+            if os.path.isfile(p):
+                os.chmod(p, 0o755)
     print("[✓] Binaires extraits dans", BUILD_DIR)
 
 def install_runtime_deps():
-    """Libs minimales pour faire tourner les binaires (libmariadb, libssl)."""
     print("\n[=] Installation des dépendances runtime...")
     apt = "sudo apt-get" if has_sudo() else "apt-get"
     r = subprocess.run(f"{apt} update -qq", shell=True)
     if r.returncode != 0:
-        print("[!] apt-get update échoué (pas de droits ?). On continue sans installer les libs.")
-        print("    Si le serveur crash, les libs libmariadb3/libssl3 sont peut-être déjà présentes dans l'image.")
+        print("[!] apt-get update échoué (pas de droits ?). On continue, les libs sont peut-être déjà présentes.")
         return
     subprocess.run(f"{apt} install -y libmariadb3 libssl3 default-mysql-client unzip", shell=True)
 
@@ -84,8 +100,7 @@ def clone_server():
         run(f"git clone --recursive https://github.com/DarkflameUniverse/DarkflameServer.git {SERVER_DIR}")
 
 def build_server():
-    master_bin = os.path.join(BUILD_DIR, "masterserver")
-    if os.path.isfile(master_bin):
+    if find_binary("master") is not None:
         print("[✓] Serveur déjà compilé, skip.")
         return
     print("\n[=] Compilation du serveur (peut prendre 5-15 min)...")
@@ -93,9 +108,10 @@ def build_server():
     run("cmake .. -DCMAKE_BUILD_TYPE=Release", cwd=BUILD_DIR)
     run("make -j$(nproc)", cwd=BUILD_DIR)
     print("\n[=] Nettoyage des fichiers de compilation...")
+    keep = set(sum(BINARY_NAMES.values(), []))
     for item in os.listdir(BUILD_DIR):
         item_path = os.path.join(BUILD_DIR, item)
-        if item not in ["masterserver", "authserver", "chatserver", "worldserver"]:
+        if item not in keep:
             if os.path.isdir(item_path):
                 shutil.rmtree(item_path, ignore_errors=True)
             elif item.endswith((".o", ".a", ".cmake")):
@@ -152,11 +168,12 @@ def test_db_connection():
 
 def start_server():
     print("\n[=] Démarrage de Darkflame Universe...")
-    master = os.path.join(BUILD_DIR, "masterserver")
-    if not os.path.isfile(master):
-        print(f"[!] ERREUR : binaire masterserver introuvable à {master}")
+    master = find_binary("master")
+    if master is None:
+        print(f"[!] ERREUR : binaire MasterServer/masterserver introuvable dans {BUILD_DIR}")
         print("    → Uploadez darkflame-bins.zip dans /home/container/")
         sys.exit(1)
+    print(f"[✓] Lancement de {master}")
     os.chdir(BUILD_DIR)
     os.execv(master, [master])
 
