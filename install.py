@@ -90,17 +90,38 @@ def download_file(url, dest):
     with urllib.request.urlopen(req, timeout=60) as r, open(dest, 'wb') as f:
         shutil.copyfileobj(r, f)
 
+def find_ld(glibc_dir):
+    """Trouve ld-linux-x86-64.so.2 et retourne le chemin vers le fichier réel."""
+    for f in os.listdir(glibc_dir):
+        if "ld-linux" in f and ".so" in f:
+            p = os.path.join(glibc_dir, f)
+            # Résoudre le symlink
+            if os.path.islink(p):
+                target = os.readlink(p)
+                if not os.path.isabs(target):
+                    target = os.path.join(glibc_dir, os.path.basename(target))
+                if os.path.isfile(target):
+                    os.chmod(target, 0o755)
+                    return p  # on retourne le symlink, patchelf suit les symlinks
+                else:
+                    # Le fichier réel (ex: ld-2.39.so) n'est pas encore extrait
+                    # On copie le contenu depuis le symlink lui-même si possible
+                    print(f"[!] Symlink {f} -> {target} introuvable, on cherche ld-2.*.so...")
+                    for g in os.listdir(glibc_dir):
+                        if g.startswith("ld-2.") and g.endswith(".so"):
+                            real = os.path.join(glibc_dir, g)
+                            os.chmod(real, 0o755)
+                            return real
+            elif os.path.isfile(p):
+                os.chmod(p, 0o755)
+                return p
+    return None
+
 def extract_so_from_tar(t, out_dir):
-    """
-    Extrait depuis un tarfile ouvert :
-    - les fichiers .so (réguliers)
-    - les symlinks .so (recréés comme vrais symlinks)
-    """
     members = t.getmembers()
-    # D'abord les fichiers réguliers
     for m in members:
         base = os.path.basename(m.name)
-        if ".so" not in base:
+        if not base or ".so" not in base:
             continue
         dest_path = os.path.join(out_dir, base)
         if m.isfile():
@@ -113,14 +134,12 @@ def extract_so_from_tar(t, out_dir):
             except Exception as e:
                 print(f"  [!] Erreur extraction {base}: {e}")
         elif m.issym():
-            # Symlink : recréer le lien
-            link_target = m.linkname
             try:
                 if os.path.lexists(dest_path):
                     os.remove(dest_path)
-                os.symlink(link_target, dest_path)
+                os.symlink(m.linkname, dest_path)
             except Exception as e:
-                print(f"  [!] Erreur symlink {base} -> {link_target}: {e}")
+                print(f"  [!] Erreur symlink {base}: {e}")
 
 def extract_tar_zst(zst_path, out_dir):
     dctx = zstd.ZstdDecompressor()
@@ -152,53 +171,54 @@ def _extract_deb_ar(deb_path, work_dir):
 def extract_deb_libs(deb_path, out_dir):
     work = deb_path + ".work"
     os.makedirs(work, exist_ok=True)
-
     r = subprocess.run(["ar", "x", deb_path], cwd=work, capture_output=True)
     if r.returncode != 0:
         data_tar = _extract_deb_ar(deb_path, work)
     else:
         data_tar = next((os.path.join(work, f) for f in os.listdir(work)
                          if f.startswith("data.tar")), None)
-
     if data_tar is None:
         print(f"[!] data.tar introuvable dans {os.path.basename(deb_path)}")
         shutil.rmtree(work, ignore_errors=True)
         return
-
     print(f"[=] Extraction {os.path.basename(data_tar)}...")
     if data_tar.endswith(".zst"):
         extract_tar_zst(data_tar, out_dir)
     else:
         with tarfile.open(data_tar) as t:
             extract_so_from_tar(t, out_dir)
-
     shutil.rmtree(work, ignore_errors=True)
 
 def setup_glibc_compat():
     if os.path.isdir(GLIBC_DIR) and any('libc' in f for f in os.listdir(GLIBC_DIR)):
         print("[✓] GLIBC compat déjà présent, skip.")
-        return
-
-    print("[=] GLIBC_2.38 requis → téléchargement libs Ubuntu 24.04...")
-    os.makedirs(GLIBC_DIR, exist_ok=True)
-    tmp = os.path.join(HOME_DIR, "glibc-tmp")
-    os.makedirs(tmp, exist_ok=True)
-
-    for url in GLIBC_DEBS:
-        deb = os.path.join(tmp, url.split('/')[-1])
-        try:
-            download_file(url, deb)
-            extract_deb_libs(deb, GLIBC_DIR)
-        except Exception as e:
-            print(f"[!] Erreur sur {url.split('/')[-1]}: {e}")
-
-    shutil.rmtree(tmp, ignore_errors=True)
-
-    libs = os.listdir(GLIBC_DIR)
-    print(f"[=] Libs extraites : {[f for f in libs if 'libc' in f or 'ld-' in f or 'libstdc' in f or 'libgcc' in f]}")
-    if not any('libc' in f for f in libs):
-        print("[!] ERREUR : libc.so.6 non trouvé après extraction")
-        sys.exit(1)
+        # Vérifier que le patching a été fait
+        master = find_binary("master")
+        if master:
+            r = subprocess.run(["ldd", master], capture_output=True, text=True)
+            if "not found" not in r.stdout and "not found" not in r.stderr:
+                return
+            print("[=] Binaires non encore patchés, re-patch...")
+        else:
+            return
+    else:
+        print("[=] GLIBC_2.38 requis → téléchargement libs Ubuntu 24.04...")
+        os.makedirs(GLIBC_DIR, exist_ok=True)
+        tmp = os.path.join(HOME_DIR, "glibc-tmp")
+        os.makedirs(tmp, exist_ok=True)
+        for url in GLIBC_DEBS:
+            deb = os.path.join(tmp, url.split('/')[-1])
+            try:
+                download_file(url, deb)
+                extract_deb_libs(deb, GLIBC_DIR)
+            except Exception as e:
+                print(f"[!] Erreur sur {url.split('/')[-1]}: {e}")
+        shutil.rmtree(tmp, ignore_errors=True)
+        libs = [f for f in os.listdir(GLIBC_DIR) if 'libc' in f or 'ld-linux' in f or 'libstdc' in f]
+        print(f"[=] Libs extraites : {libs}")
+        if not any('libc' in f for f in os.listdir(GLIBC_DIR)):
+            print("[!] ERREUR : libc.so.6 non trouvé")
+            sys.exit(1)
 
     # patchelf
     if not os.path.isfile(PATCHELF):
@@ -215,33 +235,12 @@ def setup_glibc_compat():
         os.chmod(PATCHELF, 0o755)
         os.remove(tar)
 
-    # Trouver ld-linux (fichier réel ou symlink résolu)
-    ld = None
-    for f in os.listdir(GLIBC_DIR):
-        if f.startswith("ld-linux") or f.startswith("ld-"):
-            candidate = os.path.join(GLIBC_DIR, f)
-            # Résoudre si symlink
-            if os.path.islink(candidate):
-                target = os.readlink(candidate)
-                # Si target relatif, chercher dans GLIBC_DIR
-                if not os.path.isabs(target):
-                    target = os.path.join(GLIBC_DIR, os.path.basename(target))
-                if os.path.isfile(target):
-                    ld = candidate
-                    break
-            elif os.path.isfile(candidate):
-                ld = candidate
-                break
-
+    ld = find_ld(GLIBC_DIR)
     if ld is None:
-        print(f"[!] ld-linux introuvable. Fichiers dispo : {[f for f in libs if 'ld' in f]}")
+        all_files = os.listdir(GLIBC_DIR)
+        print(f"[!] ld-linux introuvable. Fichiers : {[f for f in all_files if 'ld' in f]}")
         sys.exit(1)
-
-    # S'assurer que le fichier réel est exécutable
-    real_ld = os.path.realpath(ld)
-    if os.path.isfile(real_ld):
-        os.chmod(real_ld, 0o755)
-    os.chmod(ld, 0o755) if not os.path.islink(ld) else None
+    print(f"[✓] ld-linux trouvé : {ld}")
 
     mariadb_lib = os.path.join(BUILD_DIR, "thirdparty", "mariadb-connector-cpp",
                                "src", "mariadb_connector_cpp-build")
