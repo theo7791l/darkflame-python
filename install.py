@@ -13,6 +13,7 @@ import subprocess
 import sys
 import shutil
 import zipfile
+import importlib
 
 # ─── Variables d'environnement ───────────────────────────────────────────────
 MYSQL_HOST     = os.environ.get("MYSQL_HOST", "127.0.0.1")
@@ -27,7 +28,6 @@ BINS_ZIP   = os.path.join(HOME_DIR, "darkflame-bins.zip")
 BUILD_DIR  = os.path.join(HOME_DIR, "darkflame-build")
 SERVER_DIR = os.path.join(HOME_DIR, "DarkflameServer")
 
-# Noms possibles des binaires (avec ou sans majuscule selon la version compilée)
 BINARY_NAMES = {
     "master": ["MasterServer", "masterserver"],
     "auth":   ["AuthServer",   "authserver"],
@@ -77,7 +77,7 @@ def install_runtime_deps():
         return
     subprocess.run(f"{apt} install -y libmariadb3 libssl3 unzip", shell=True)
 
-# ─── Mode compilation depuis les sources ─────────────────────────────────────
+# ─── Mode compilation ───────────────────────────────────────────────────────────
 
 def install_build_deps():
     print("\n[=] Installation des dépendances de compilation...")
@@ -91,52 +91,48 @@ def install_build_deps():
 
 def clone_server():
     if os.path.exists(SERVER_DIR):
-        print("[=] DarkflameServer déjà cloné, mise à jour...")
         run("git pull", cwd=SERVER_DIR)
     else:
-        print("[=] Clonage de DarkflameServer...")
         run(f"git clone --recursive https://github.com/DarkflameUniverse/DarkflameServer.git {SERVER_DIR}")
 
 def build_server():
     if find_binary("master") is not None:
         print("[✓] Serveur déjà compilé, skip.")
         return
-    print("\n[=] Compilation du serveur (peut prendre 5-15 min)...")
     os.makedirs(BUILD_DIR, exist_ok=True)
     run("cmake .. -DCMAKE_BUILD_TYPE=Release", cwd=BUILD_DIR)
     run("make -j$(nproc)", cwd=BUILD_DIR)
-    print("\n[=] Nettoyage des fichiers de compilation...")
     keep = set(sum(BINARY_NAMES.values(), []))
     for item in os.listdir(BUILD_DIR):
         item_path = os.path.join(BUILD_DIR, item)
         if item not in keep:
-            if os.path.isdir(item_path):
-                shutil.rmtree(item_path, ignore_errors=True)
-            elif item.endswith((".o", ".a", ".cmake")):
-                os.remove(item_path)
+            if os.path.isdir(item_path): shutil.rmtree(item_path, ignore_errors=True)
+            elif item.endswith((".o", ".a", ".cmake")): os.remove(item_path)
     shutil.rmtree(SERVER_DIR, ignore_errors=True)
-    print("[✓] Compilation + nettoyage terminés !")
+    print("[✓] Compilation terminée !")
 
 # ─── Commun ──────────────────────────────────────────────────────────────────
 
-def install_pymysql():
-    """Installe pymysql via pip (pas besoin de sudo)."""
-    r = subprocess.run("pip install pymysql -q", shell=True)
-    if r.returncode != 0:
-        print("[!] Impossible d'installer pymysql via pip.")
-        return False
-    return True
+def ensure_pymysql():
+    """Installe pymysql dans le bon chemin Python et l'importe."""
+    try:
+        import pymysql
+        return pymysql
+    except ImportError:
+        pass
+    print("[=] Installation de pymysql...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "pymysql", "-q"],
+        check=True
+    )
+    # Forcer Python à recharger les chemins
+    importlib.invalidate_caches()
+    import pymysql
+    return pymysql
 
 def test_db_connection():
     print("\n[=] Test de connexion à la base de données...")
-    try:
-        import pymysql
-    except ImportError:
-        print("[=] pymysql non trouvé, installation...")
-        if not install_pymysql():
-            print("[!] Skip test DB (pymysql indisponible).")
-            return
-        import pymysql
+    pymysql = ensure_pymysql()
     try:
         conn = pymysql.connect(
             host=MYSQL_HOST,
@@ -186,7 +182,7 @@ def start_server():
     print("\n[=] Démarrage de Darkflame Universe...")
     master = find_binary("master")
     if master is None:
-        print(f"[!] ERREUR : binaire MasterServer/masterserver introuvable dans {BUILD_DIR}")
+        print(f"[!] ERREUR : MasterServer introuvable dans {BUILD_DIR}")
         print("    → Uploadez darkflame-bins.zip dans /home/container/")
         sys.exit(1)
     print(f"[✓] Lancement de {master}")
