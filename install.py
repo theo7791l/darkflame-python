@@ -12,6 +12,7 @@ import zipfile
 import configparser
 import urllib.request
 import tarfile
+import io
 
 def pip_install(pkg):
     subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
@@ -45,14 +46,12 @@ BINARY_NAMES = {
     "world":  ["WorldServer",  "worldserver"],
 }
 
-# URLs réelles vérifiées sur packages.ubuntu.com Noble
 SEC = "http://security.ubuntu.com/ubuntu/pool/main"
 GLIBC_DEBS = [
     f"{SEC}/g/glibc/libc6_2.39-0ubuntu8.7_amd64.deb",
     f"{SEC}/g/gcc-14/libstdc++6_14.2.0-4ubuntu2~24.04.1_amd64.deb",
     f"{SEC}/g/gcc-14/libgcc-s1_14.2.0-4ubuntu2~24.04.1_amd64.deb",
 ]
-
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
 def load_config():
@@ -91,27 +90,48 @@ def download_file(url, dest):
     with urllib.request.urlopen(req, timeout=60) as r, open(dest, 'wb') as f:
         shutil.copyfileobj(r, f)
 
+def extract_so_from_tar(t, out_dir):
+    """
+    Extrait depuis un tarfile ouvert :
+    - les fichiers .so (réguliers)
+    - les symlinks .so (recréés comme vrais symlinks)
+    """
+    members = t.getmembers()
+    # D'abord les fichiers réguliers
+    for m in members:
+        base = os.path.basename(m.name)
+        if ".so" not in base:
+            continue
+        dest_path = os.path.join(out_dir, base)
+        if m.isfile():
+            try:
+                src = t.extractfile(m)
+                if src:
+                    with open(dest_path, 'wb') as f:
+                        shutil.copyfileobj(src, f)
+                    os.chmod(dest_path, 0o755)
+            except Exception as e:
+                print(f"  [!] Erreur extraction {base}: {e}")
+        elif m.issym():
+            # Symlink : recréer le lien
+            link_target = m.linkname
+            try:
+                if os.path.lexists(dest_path):
+                    os.remove(dest_path)
+                os.symlink(link_target, dest_path)
+            except Exception as e:
+                print(f"  [!] Erreur symlink {base} -> {link_target}: {e}")
+
 def extract_tar_zst(zst_path, out_dir):
-    """Extrait un data.tar.zst avec le module zstandard."""
-    import io
     dctx = zstd.ZstdDecompressor()
     with open(zst_path, 'rb') as f:
-        with dctx.stream_reader(f) as reader:
-            tar_bytes = reader.read()
+        tar_bytes = dctx.stream_reader(f).read()
     with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as t:
-        for m in t.getmembers():
-            if ".so" in m.name:
-                m.name = os.path.basename(m.name)
-                try:
-                    t.extract(m, out_dir)
-                except Exception:
-                    pass
+        extract_so_from_tar(t, out_dir)
 
 def _extract_deb_ar(deb_path, work_dir):
-    """Extrait le data.tar.* d'un .deb via format ar en pur Python."""
     with open(deb_path, 'rb') as f:
         if f.read(8) != b'!<arch>\n':
-            print(f"[!] {os.path.basename(deb_path)} n'est pas un .deb valide")
             return None
         while True:
             header = f.read(60)
@@ -133,7 +153,6 @@ def extract_deb_libs(deb_path, out_dir):
     work = deb_path + ".work"
     os.makedirs(work, exist_ok=True)
 
-    # Essai avec ar
     r = subprocess.run(["ar", "x", deb_path], cwd=work, capture_output=True)
     if r.returncode != 0:
         data_tar = _extract_deb_ar(deb_path, work)
@@ -151,13 +170,7 @@ def extract_deb_libs(deb_path, out_dir):
         extract_tar_zst(data_tar, out_dir)
     else:
         with tarfile.open(data_tar) as t:
-            for m in t.getmembers():
-                if ".so" in m.name:
-                    m.name = os.path.basename(m.name)
-                    try:
-                        t.extract(m, out_dir)
-                    except Exception:
-                        pass
+            extract_so_from_tar(t, out_dir)
 
     shutil.rmtree(work, ignore_errors=True)
 
@@ -182,7 +195,7 @@ def setup_glibc_compat():
     shutil.rmtree(tmp, ignore_errors=True)
 
     libs = os.listdir(GLIBC_DIR)
-    print(f"[=] Libs extraites : {libs}")
+    print(f"[=] Libs extraites : {[f for f in libs if 'libc' in f or 'ld-' in f or 'libstdc' in f or 'libgcc' in f]}")
     if not any('libc' in f for f in libs):
         print("[!] ERREUR : libc.so.6 non trouvé après extraction")
         sys.exit(1)
@@ -194,22 +207,41 @@ def setup_glibc_compat():
         download_file(PATCHELF_URL, tar)
         with tarfile.open(tar) as t:
             for m in t.getmembers():
-                if m.name.endswith("patchelf"):
-                    m.name = "patchelf"
-                    t.extract(m, HOME_DIR)
+                if m.name.endswith("patchelf") and m.isfile():
+                    src = t.extractfile(m)
+                    with open(PATCHELF, 'wb') as out:
+                        shutil.copyfileobj(src, out)
                     break
         os.chmod(PATCHELF, 0o755)
         os.remove(tar)
 
-    ld = next(
-        (os.path.join(GLIBC_DIR, f) for f in os.listdir(GLIBC_DIR)
-         if f.startswith("ld-linux") or ("ld-" in f and ".so" in f)),
-        None
-    )
+    # Trouver ld-linux (fichier réel ou symlink résolu)
+    ld = None
+    for f in os.listdir(GLIBC_DIR):
+        if f.startswith("ld-linux") or f.startswith("ld-"):
+            candidate = os.path.join(GLIBC_DIR, f)
+            # Résoudre si symlink
+            if os.path.islink(candidate):
+                target = os.readlink(candidate)
+                # Si target relatif, chercher dans GLIBC_DIR
+                if not os.path.isabs(target):
+                    target = os.path.join(GLIBC_DIR, os.path.basename(target))
+                if os.path.isfile(target):
+                    ld = candidate
+                    break
+            elif os.path.isfile(candidate):
+                ld = candidate
+                break
+
     if ld is None:
-        print(f"[!] ld-linux introuvable dans {GLIBC_DIR}: {libs}")
+        print(f"[!] ld-linux introuvable. Fichiers dispo : {[f for f in libs if 'ld' in f]}")
         sys.exit(1)
-    os.chmod(ld, 0o755)
+
+    # S'assurer que le fichier réel est exécutable
+    real_ld = os.path.realpath(ld)
+    if os.path.isfile(real_ld):
+        os.chmod(real_ld, 0o755)
+    os.chmod(ld, 0o755) if not os.path.islink(ld) else None
 
     mariadb_lib = os.path.join(BUILD_DIR, "thirdparty", "mariadb-connector-cpp",
                                "src", "mariadb_connector_cpp-build")
@@ -221,7 +253,7 @@ def setup_glibc_compat():
             print(f"[=] Patch {os.path.basename(b)} → GLIBC compat...")
             run(f"{PATCHELF} --set-interpreter {ld} --set-rpath {rpath} {b}")
 
-    print("[✓] Binaires patchés avec GLIBC 2.39 (Ubuntu 24.04).")
+    print("[✓] Binaires patchés avec GLIBC 2.39.")
 
 def setup_ld_library_path():
     paths = [BUILD_DIR, GLIBC_DIR]
