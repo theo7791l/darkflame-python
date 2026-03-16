@@ -22,7 +22,7 @@
   },
   "scripts": {
     "installation": {
-      "script": "#!/bin/bash\napt-get update -qq && apt-get install -y git python3 python3-pip\ngit clone https://github.com/theo7791l/darkflame-python.git /mnt/server\ncp /mnt/server/config_template.ini /home/container/config_template.ini\necho '[✓] Installation Darkflame terminée'",
+      "script": "#!/bin/bash\napt-get update -qq && apt-get install -y git python3 python3-pip\ngit clone https://github.com/theo7791l/darkflame-python.git /mnt/server\ncp /mnt/server/config_template.ini /mnt/server/config_template.ini\necho '[✓] Installation Darkflame terminée'",
       "container": "ghcr.io/pterodactyl/installers:debian",
       "entrypoint": "bash"
     }
