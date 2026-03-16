@@ -1,0 +1,86 @@
+{
+  "_comment": "Pterodactyl Egg - Darkflame Universe (à importer dans Admin > Nests)",
+  "meta": {
+    "version": "PTDL_v2",
+    "update_url": null
+  },
+  "exported_at": "2026-03-16T00:00:00+00:00",
+  "name": "Darkflame Universe",
+  "author": "theo7791l",
+  "description": "Serveur Darkflame Universe (LEGO Universe) avec DB externe sur container Python",
+  "features": null,
+  "docker_images": {
+    "Python 3.11": "ghcr.io/pterodactyl/yolks:python_3.11"
+  },
+  "file_denylist": [],
+  "startup": "python3 /home/container/install.py",
+  "config": {
+    "files": "{}",
+    "startup": "{\"done\": \"Darkflame Universe\"}",
+    "logs": "{}",
+    "stop": "^C"
+  },
+  "scripts": {
+    "installation": {
+      "script": "#!/bin/bash\napt-get update -qq && apt-get install -y git python3 python3-pip\ngit clone https://github.com/theo7791l/darkflame-python.git /mnt/server\ncp /mnt/server/config_template.ini /home/container/config_template.ini\necho '[✓] Installation Darkflame terminée'",
+      "container": "ghcr.io/pterodactyl/installers:debian",
+      "entrypoint": "bash"
+    }
+  },
+  "variables": [
+    {
+      "name": "MySQL Host",
+      "description": "Adresse IP ou hostname de la base de données externe",
+      "env_variable": "MYSQL_HOST",
+      "default_value": "127.0.0.1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:255"
+    },
+    {
+      "name": "MySQL Port",
+      "description": "Port de la base de données",
+      "env_variable": "MYSQL_PORT",
+      "default_value": "3306",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|numeric"
+    },
+    {
+      "name": "MySQL Database",
+      "description": "Nom de la base de données",
+      "env_variable": "MYSQL_DATABASE",
+      "default_value": "darkflame",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:100"
+    },
+    {
+      "name": "MySQL User",
+      "description": "Utilisateur MySQL",
+      "env_variable": "MYSQL_USER",
+      "default_value": "dlu_user",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:100"
+    },
+    {
+      "name": "MySQL Password",
+      "description": "Mot de passe MySQL",
+      "env_variable": "MYSQL_PASSWORD",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:255"
+    },
+    {
+      "name": "Client Path",
+      "description": "Chemin vers les fichiers client LEGO Universe",
+      "env_variable": "CLIENT_PATH",
+      "default_value": "/home/container/client",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:255"
+    }
+  ]
+}
