@@ -13,6 +13,7 @@ import configparser
 import urllib.request
 import tarfile
 import io
+import time
 
 def pip_install(pkg):
     subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
@@ -40,6 +41,8 @@ GLIBC_DIR    = os.path.join(HOME_DIR, "glibc-compat")
 PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
+PLAYIT_BIN   = os.path.join(HOME_DIR, "playit")
+PLAYIT_URL   = "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64"
 
 DFS_TARBALL_URL = "https://github.com/DarkflameUniverse/DarkflameServer/archive/refs/heads/main.tar.gz"
 
@@ -532,21 +535,14 @@ def _cfg_get(cfg, section, option, fallback):
 
 
 def write_config(cfg):
-    """
-    Génère les 4 fichiers de config avec les bons ports pour chaque serveur.
-    DarkflameServer lit auth_server_port dans authconfig.ini, etc.
-    Chaque config reçoit TOUTES les clés, mais avec le port principal
-    correspondant à son rôle mis en avant via server_port.
-    """
     print("\n[=] Écriture de la configuration...")
     os.makedirs(BUILD_DIR, exist_ok=True)
 
-    # Récupère les valeurs
     external_ip   = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
     auth_port     = _cfg_get(cfg, "Networking", "auth_server_port",   "25896")
     world_port    = _cfg_get(cfg, "Networking", "world_server_port",  "25740")
     chat_port     = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
-    master_port   = _cfg_get(cfg, "Networking", "master_server_port", "4000")
+    master_port   = _cfg_get(cfg, "Networking", "master_server_port", "25846")
     mysql_host    = _cfg_get(cfg, "Database",   "mysql_host",         "")
     mysql_port    = _cfg_get(cfg, "Database",   "mysql_port",         "3306")
     mysql_db      = _cfg_get(cfg, "Database",   "mysql_database",     "")
@@ -564,7 +560,6 @@ def write_config(cfg):
         print("[!] ATTENTION : external_ip=0.0.0.0 — les clients ne pourront pas se connecter !")
         print("[!] Ajoutez la variable d'env EXTERNAL_IP=<votre_ip_publique> dans FeatherPanel.")
 
-    # Contenu commun à toutes les configs
     common = (
         f"[Database]\n"
         f"mysql_host={mysql_host}\n"
@@ -619,6 +614,63 @@ def check_client_files(cfg):
     print(f"[✓] Fichiers client OK à {client_path}")
 
 
+def start_playit():
+    """
+    Lance playit.gg en arrière-plan si PLAYIT_SECRET est défini dans les variables d'env.
+    PLAYIT_SECRET = clé secrète du tunnel playit (depuis le dashboard playit.gg).
+    Si PLAYIT_SECRET n'est pas défini, playit affichera un claim code dans les logs
+    pour lier l'agent à votre compte.
+    """
+    use_playit = os.environ.get("USE_PLAYIT", "").lower() in ("1", "true", "yes")
+    if not use_playit:
+        return
+
+    print("\n[=] Playit.gg activé (USE_PLAYIT=1)...")
+
+    if not os.path.isfile(PLAYIT_BIN):
+        print("[=] Téléchargement de playit-linux-amd64...")
+        try:
+            download_file(PLAYIT_URL, PLAYIT_BIN)
+            os.chmod(PLAYIT_BIN, 0o755)
+            print("[✓] playit téléchargé.")
+        except Exception as e:
+            print(f"[!] Impossible de télécharger playit : {e}")
+            return
+
+    playit_secret = os.environ.get("PLAYIT_SECRET", "")
+    env = os.environ.copy()
+
+    if playit_secret:
+        env["PLAYIT_SECRET"] = playit_secret
+        print("[=] Lancement playit avec secret configuré...")
+    else:
+        print("[!] PLAYIT_SECRET non défini — playit va afficher un claim code dans les logs.")
+        print("[!] Copiez ce code sur https://playit.gg pour lier l'agent à votre compte.")
+
+    log_path = os.path.join(HOME_DIR, "playit.log")
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(
+            [PLAYIT_BIN],
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT
+        )
+    print(f"[✓] playit lancé en arrière-plan (PID {proc.pid}), logs → {log_path}")
+    print("[=] Attente 5s pour que le tunnel s'établisse...")
+    time.sleep(5)
+
+    # Affiche les premières lignes de log pour voir le claim code si besoin
+    try:
+        with open(log_path, "r") as lf:
+            lines = lf.readlines()
+            if lines:
+                print("[=] Logs playit (début) :")
+                for line in lines[:20]:
+                    print(f"    {line.rstrip()}")
+    except Exception:
+        pass
+
+
 def start_server():
     print("\n[=] Démarrage de Darkflame Universe...")
     master = find_binary("master")
@@ -651,6 +703,7 @@ def main():
     test_db_connection(cfg)
     write_config(cfg)
     setup_server_data(cfg)
+    start_playit()
     start_server()
 
 
