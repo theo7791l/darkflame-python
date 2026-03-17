@@ -6,6 +6,8 @@ pour container Python Pterodactyl avec DB externe
 
 import os
 import re
+import pty
+import select
 import subprocess
 import sys
 import shutil
@@ -67,10 +69,17 @@ GLIBC_DEBS = [
 ]
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
-ANSI_ESCAPE = re.compile(r'(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]|\x1B[\x20-\x2F]*[\x30-\x7E]|[\x1B\x9B][()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><~]|\x1b\[\?[0-9]+[hl]|\x1b\[[0-9;]*m')
+ANSI_ESCAPE = re.compile(
+    rb'(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]'
+    rb'|\x1B[\x20-\x2F]*[\x30-\x7E]'
+    rb'|[\x1B\x9B][()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><~]'
+    rb'|\x1b\[\?[0-9]+[hl]'
+    rb'|\x1b\[[0-9;]*m'
+    rb'|\r'
+)
 
-def strip_ansi(text):
-    return ANSI_ESCAPE.sub('', text)
+def strip_ansi_bytes(data: bytes) -> bytes:
+    return ANSI_ESCAPE.sub(b'', data)
 
 
 def load_config():
@@ -620,12 +629,35 @@ def check_client_files(cfg):
     print(f"[✓] Fichiers client OK à {client_path}")
 
 
+def _read_pty_output(master_fd, timeout_sec=10):
+    """
+    Lit l'output d'un fd PTY pendant timeout_sec secondes.
+    Retourne les bytes bruts accumulés.
+    """
+    buf = b""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        try:
+            rlist, _, _ = select.select([master_fd], [], [], min(remaining, 0.5))
+        except (ValueError, OSError):
+            break
+        if rlist:
+            try:
+                chunk = os.read(master_fd, 4096)
+                if not chunk:
+                    break
+                buf += chunk
+            except OSError:
+                break
+    return buf
+
+
 def start_playit():
     """
-    Lance playit.gg en arrière-plan automatiquement.
-    NO_COLOR=1 + TERM=dumb désactivent la TUI pour un output texte lisible.
-    Si PLAYIT_SECRET est défini en variable d'env, il est utilisé directement.
-    Sinon, le claim code apparaît dans les logs du panel et dans playit.log.
+    Lance playit.gg via un faux PTY (module pty) pour capturer l'output de la TUI,
+    strippe les séquences ANSI, et affiche le claim code proprement.
+    Si PLAYIT_SECRET est défini, il est passé en variable d'env.
     """
     print("\n[=] Démarrage de playit.gg...")
 
@@ -637,51 +669,61 @@ def start_playit():
             print("[✓] playit téléchargé.")
         except Exception as e:
             print(f"[!] Impossible de télécharger playit : {e}")
-            print("[!] Continuer sans playit...")
             return
 
     env = os.environ.copy()
-    # Désactive la TUI interactive pour avoir un output texte propre
-    env["NO_COLOR"]  = "1"
-    env["TERM"]      = "dumb"
-    env["CLICOLOR"]  = "0"
-
     playit_secret = os.environ.get("PLAYIT_SECRET", "")
     if playit_secret:
         env["PLAYIT_SECRET"] = playit_secret
         print("[=] Lancement playit avec secret configuré...")
     else:
-        print("[!] PLAYIT_SECRET non défini — un claim code va apparaître ci-dessous.")
+        print("[!] PLAYIT_SECRET non défini — le claim code va apparaître ci-dessous.")
 
     log_path = os.path.join(HOME_DIR, "playit.log")
-    with open(log_path, "w") as log_file:
+
+    # Crée un faux PTY pour que playit pense avoir un terminal
+    master_fd, slave_fd = pty.openpty()
+    try:
         proc = subprocess.Popen(
             [PLAYIT_BIN],
             env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
         )
-    print(f"[✓] playit lancé (PID {proc.pid}), attente 8s...")
-    time.sleep(8)
+        os.close(slave_fd)  # le parent n'en a plus besoin
+        slave_fd = -1
+        print(f"[✓] playit lancé (PID {proc.pid}), lecture 12s...")
 
-    try:
-        with open(log_path, "rb") as lf:
-            raw = lf.read().decode("utf-8", errors="replace")
-        clean = strip_ansi(raw)
-        lines = [l for l in clean.splitlines() if l.strip()]
-        if lines:
-            print("[=] ===== PLAYIT LOGS =====")
-            for line in lines[:30]:
-                print(f"    {line}")
-            print("[=] ======================")
-            # Cherche et met en avant le claim code
-            for line in lines:
-                if "playit.gg/claim" in line or "claim" in line.lower():
-                    print(f"[>>>] CLAIM CODE : {line.strip()}")
-        else:
-            print("[!] playit.log vide après 8s.")
-    except Exception as e:
-        print(f"[!] Erreur lecture playit.log : {e}")
+        raw = _read_pty_output(master_fd, timeout_sec=12)
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        if slave_fd != -1:
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+
+    # Sauvegarde raw + version propre dans playit.log
+    clean = strip_ansi_bytes(raw).decode("utf-8", errors="replace")
+    with open(log_path, "w") as lf:
+        lf.write(clean)
+
+    lines = [l for l in clean.splitlines() if l.strip()]
+    if lines:
+        print("[=] ===== PLAYIT LOGS =====")
+        for line in lines[:30]:
+            print(f"    {line}")
+        print("[=] ======================")
+        for line in lines:
+            if "playit.gg/claim" in line or ("claim" in line.lower() and "http" in line.lower()):
+                print(f"[>>>] CLAIM CODE : {line.strip()}")
+    else:
+        print("[!] Aucun output playit après 12s.")
 
 
 def start_server():
