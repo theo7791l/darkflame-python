@@ -743,20 +743,16 @@ def write_config(cfg):
     use_custom_fdb = _cfg_get(cfg, "General", "use_custom_fdb",  "0")
     fdb_path       = _cfg_get(cfg, "General", "fdb_path",        "")
 
-    external_ip      = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
-    auth_port        = _cfg_get(cfg, "Networking", "auth_server_port",   "25896")
-    world_port       = _cfg_get(cfg, "Networking", "world_server_port",  "25740")
-    chat_port        = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
-    master_port      = _cfg_get(cfg, "Networking", "master_server_port", "25846")
+    external_ip  = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
+    auth_port    = _cfg_get(cfg, "Networking", "auth_server_port",   "25896")
+    world_port   = _cfg_get(cfg, "Networking", "world_server_port",  "25740")
+    chat_port    = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
+    master_port  = _cfg_get(cfg, "Networking", "master_server_port", "25846")
 
-    # world_port_start contrôle sur quel port le WorldServer spawne les zones.
-    # DarkflameServer fait : port = world_port_start + instance_id
-    # Zone 1000 = instance 1 donc port = world_port_start + 1
-    # On a seulement 25740 d'ouvert → world_port_start = 25739
-    # Zone 0 (lobby interne) = instance 0 → 25739 (non exposé, pas besoin)
-    # Zone 1000 instance 1 → 25739 + 1 = 25740 ✓
-    env_world_port_start = os.environ.get("WORLD_PORT_START", "").strip()
-    world_port_start = env_world_port_start if env_world_port_start else "25739"
+    # world_port_start : DFS fait port = start + instance_id
+    # Zone 1000 instance 1 = start + 1 = 25740 => start = 25739
+    env_wps = os.environ.get("WORLD_PORT_START", "").strip()
+    world_port_start = env_wps if env_wps else "25739"
 
     max_offline_time       = _cfg_get(cfg, "Gameplay", "max_offline_time",       "0")
     kick_after_failed_auth = _cfg_get(cfg, "Gameplay", "kick_after_failed_auth", "1")
@@ -769,16 +765,15 @@ def write_config(cfg):
     log_to_console = _cfg_get(cfg, "Logging", "log_to_console", "1")
     log_to_file    = _cfg_get(cfg, "Logging", "log_to_file",    "0")
 
-    print(f"[=] external_ip              = {external_ip}")
-    print(f"[=] auth_server_port         = {auth_port}")
-    print(f"[=] world_server_port        = {world_port}")
-    print(f"[=] world_port_start         = {world_port_start} (zone 1000 instance 1 = {int(world_port_start)+1})")
-    print(f"[=] chat_server_port         = {chat_port}")
-    print(f"[=] master_server_port       = {master_port}")
+    print(f"[=] external_ip        = {external_ip}")
+    print(f"[=] auth_server_port   = {auth_port}")
+    print(f"[=] world_server_port  = {world_port}")
+    print(f"[=] world_port_start   = {world_port_start} (zone 1000 instance 1 = {int(world_port_start)+1})")
+    print(f"[=] chat_server_port   = {chat_port}")
+    print(f"[=] master_server_port = {master_port}")
 
     if external_ip == "0.0.0.0":
-        print("[!] ATTENTION : external_ip=0.0.0.0 — les clients ne pourront pas se connecter !")
-        print("[!] Ajoutez la variable d'env EXTERNAL_IP=<votre_ip_publique> dans Pterodactyl.")
+        print("[!] ATTENTION : external_ip=0.0.0.0 — ajoutez EXTERNAL_IP dans Pterodactyl.")
 
     common = (
         f"[Database]\n"
@@ -839,7 +834,7 @@ def check_client_files(cfg):
     if not os.path.isdir(client_path):
         print(f"[!] ERREUR : client introuvable à {client_path}")
         sys.exit(1)
-    required = ["res/cdclient.fdb", "locale/locale.xml")
+    required = ["res/cdclient.fdb", "locale/locale.xml"]
     missing = [f for f in required if not os.path.isfile(os.path.join(client_path, f))]
     if missing:
         print(f"[!] Fichiers client manquants : {', '.join(missing)}")
