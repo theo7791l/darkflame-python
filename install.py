@@ -41,6 +41,9 @@ PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
 
+# Répertoire pour le clone sparse de DarkflameServer (navmeshes uniquement)
+DFS_SPARSE_DIR = os.path.join(HOME_DIR, ".dfs-sparse")
+
 BINARY_NAMES = {
     "master": ["MasterServer", "masterserver"],
     "auth":   ["AuthServer",   "authserver"],
@@ -57,10 +60,6 @@ GLIBC_DEBS = [
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
 def load_config():
-    """
-    Charge la config depuis config_template.ini en injectant les variables
-    d'environnement Pterodactyl si disponibles.
-    """
     if not os.path.isfile(CONFIG_FILE):
         print(f"[!] ERREUR : {CONFIG_FILE} introuvable !")
         sys.exit(1)
@@ -90,14 +89,12 @@ def load_config():
 
 
 def find_binary(name_key):
-    """Cherche un binaire dans BUILD_DIR et ses sous-dossiers immédiats."""
     search_dirs = [BUILD_DIR]
     if os.path.isdir(BUILD_DIR):
         for entry in os.listdir(BUILD_DIR):
             sub = os.path.join(BUILD_DIR, entry)
             if os.path.isdir(sub):
                 search_dirs.append(sub)
-
     for name in BINARY_NAMES[name_key]:
         for d in search_dirs:
             path = os.path.join(d, name)
@@ -112,7 +109,6 @@ def run(cmd, cwd=None, check=True):
 
 
 def needs_glibc_compat():
-    """Retourne True si les binaires nécessitent une GLIBC plus récente."""
     master = find_binary("master")
     if master is None:
         return False
@@ -132,13 +128,7 @@ def download_file(url, dest):
 
 
 def extract_so_from_tar(t, out_dir):
-    """
-    Extrait depuis un tarfile tous les .so et ld-linux.
-    Vérifie que la cible d'un symlink existe avant de le créer.
-    """
     members = t.getmembers()
-
-    # Pass 1 : fichiers réguliers
     for m in members:
         base = os.path.basename(m.name)
         if not base:
@@ -159,7 +149,6 @@ def extract_so_from_tar(t, out_dir):
         except Exception as e:
             print(f"  [!] Erreur extraction {base}: {e}")
 
-    # Pass 2 : symlinks — uniquement si la cible existe
     for m in members:
         base = os.path.basename(m.name)
         if not base or not m.issym():
@@ -169,14 +158,12 @@ def extract_so_from_tar(t, out_dir):
         dest_path   = os.path.join(out_dir, base)
         link_target = os.path.basename(m.linkname)
         target_path = os.path.join(out_dir, link_target)
-
         if link_target == base:
             print(f"  [!] Symlink circulaire ignoré : {base} -> {link_target}")
             continue
         if not os.path.isfile(target_path):
             print(f"  [!] Cible absente pour symlink {base} -> {link_target}, skip")
             continue
-
         try:
             if os.path.lexists(dest_path):
                 os.remove(dest_path)
@@ -237,11 +224,6 @@ def extract_deb_libs(deb_path, out_dir):
 
 
 def find_ld(glibc_dir):
-    """
-    Retourne le chemin absolu vers ld-linux ou ld-2.*.so.
-    Priorité au fichier réel, détection symlinks circulaires.
-    """
-    # Priorité 1 : fichier réel ld-2.*.so (ex: ld-2.39.so)
     for f in os.listdir(glibc_dir):
         if f.startswith("ld-2.") and f.endswith(".so"):
             p = os.path.join(glibc_dir, f)
@@ -249,8 +231,6 @@ def find_ld(glibc_dir):
                 os.chmod(p, 0o755)
                 print(f"[✓] ld réel trouvé : {f}")
                 return p
-
-    # Priorité 2 : symlink ld-linux-x86-64.so.2 pointant vers un fichier réel
     for f in os.listdir(glibc_dir):
         if "ld-linux" in f:
             p = os.path.join(glibc_dir, f)
@@ -270,8 +250,6 @@ def find_ld(glibc_dir):
                 os.chmod(p, 0o755)
                 print(f"[✓] ld-linux fichier direct : {f}")
                 return p
-
-    # Priorité 3 : tout fichier commençant par ld- (résolution réelle)
     for f in os.listdir(glibc_dir):
         if f.startswith("ld-"):
             p = os.path.join(glibc_dir, f)
@@ -280,7 +258,6 @@ def find_ld(glibc_dir):
                 os.chmod(resolved, 0o755)
                 print(f"[✓] ld fallback : {f} -> {resolved}")
                 return resolved
-
     return None
 
 
@@ -390,25 +367,58 @@ def extract_prebuilt():
     print("[✓] Binaires extraits dans", BUILD_DIR)
 
 
+def fetch_navmeshes():
+    """
+    Récupère le dossier navmeshes depuis le repo DarkflameServer via sparse-checkout.
+    navmeshes/ est dans le repo source, pas dans le client LEGO Universe.
+    """
+    dest = os.path.join(BUILD_DIR, "navmeshes")
+    if os.path.isdir(dest):
+        print("[✓] navmeshes/ déjà présent, skip.")
+        return
+
+    print("[=] Récupération navmeshes depuis DarkflameServer...")
+    os.makedirs(DFS_SPARSE_DIR, exist_ok=True)
+
+    # Init repo vide si pas encore fait
+    if not os.path.isdir(os.path.join(DFS_SPARSE_DIR, ".git")):
+        run(f"git init {DFS_SPARSE_DIR}", check=False)
+        run(f"git -C {DFS_SPARSE_DIR} remote add origin https://github.com/DarkflameUniverse/DarkflameServer.git", check=False)
+
+    # Sparse checkout sur navmeshes/ uniquement
+    run(f"git -C {DFS_SPARSE_DIR} config core.sparseCheckout true", check=False)
+    sparse_file = os.path.join(DFS_SPARSE_DIR, ".git", "info", "sparse-checkout")
+    with open(sparse_file, "w") as f:
+        f.write("navmeshes/\n")
+
+    # Pull uniquement les fichiers nécessaires (depth=1)
+    r = run(f"git -C {DFS_SPARSE_DIR} pull --depth=1 origin main", check=False)
+    if r.returncode != 0:
+        # Essayer avec 'dev' si 'main' échoue
+        r = run(f"git -C {DFS_SPARSE_DIR} pull --depth=1 origin dev", check=False)
+
+    src_navmeshes = os.path.join(DFS_SPARSE_DIR, "navmeshes")
+    if os.path.isdir(src_navmeshes):
+        shutil.copytree(src_navmeshes, dest)
+        print(f"[✓] navmeshes/ copié dans {BUILD_DIR}")
+    else:
+        print("[!] navmeshes/ introuvable dans DarkflameServer — le serveur continuera sans (non bloquant).")
+
+
 def setup_server_data(cfg):
     """
-    Copie les dossiers/fichiers requis par DarkflameServer depuis le client
-    vers BUILD_DIR : navmeshes, res, locale.
-    Ces dossiers doivent être dans le même répertoire que les binaires.
+    Copie res/ et locale/ depuis le client vers BUILD_DIR.
+    Récupère navmeshes/ depuis le repo DarkflameServer.
     """
     print("\n[=] Vérification des données serveur (navmeshes, res, locale)...")
     client_path = cfg.get("General", "client_location", fallback="/home/container/client")
 
-    copies = [
-        # (source dans le client,          dest dans BUILD_DIR,  obligatoire)
-        (os.path.join(client_path, "navmeshes"),              os.path.join(BUILD_DIR, "navmeshes"),  True),
-        (os.path.join(client_path, "res"),                    os.path.join(BUILD_DIR, "res"),        True),
-        (os.path.join(client_path, "locale"),                 os.path.join(BUILD_DIR, "locale"),     True),
-        # fdb peut aussi être directement à la racine du client
-        (os.path.join(client_path, "res", "cdclient.fdb"),   os.path.join(BUILD_DIR, "res", "cdclient.fdb"), False),
+    # res/ et locale/ viennent du client LEGO Universe
+    client_copies = [
+        (os.path.join(client_path, "res"),    os.path.join(BUILD_DIR, "res")),
+        (os.path.join(client_path, "locale"), os.path.join(BUILD_DIR, "locale")),
     ]
-
-    for src, dst, required in copies:
+    for src, dst in client_copies:
         if os.path.isdir(src):
             if os.path.exists(dst):
                 print(f"[✓] {os.path.basename(dst)}/ déjà présent, skip.")
@@ -416,18 +426,15 @@ def setup_server_data(cfg):
                 print(f"[=] Copie {os.path.basename(src)}/ → {dst} ...")
                 shutil.copytree(src, dst)
                 print(f"[✓] {os.path.basename(src)}/ copié.")
-        elif os.path.isfile(src):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            if not os.path.isfile(dst):
-                shutil.copy2(src, dst)
         else:
-            if required:
-                print(f"[!] ERREUR : {src} introuvable dans le client !")
-                sys.exit(1)
+            print(f"[!] ERREUR : {src} introuvable dans le client !")
+            sys.exit(1)
 
-    # Créer le dossier logs s'il n'existe pas (évite des warnings DarkflameServer)
-    logs_dir = os.path.join(BUILD_DIR, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
+    # navmeshes vient du repo DarkflameServer
+    fetch_navmeshes()
+
+    # Créer le dossier logs
+    os.makedirs(os.path.join(BUILD_DIR, "logs"), exist_ok=True)
 
     print("[✓] Données serveur OK.")
 
@@ -492,12 +499,8 @@ def test_db_connection(cfg):
 
 
 def write_config(cfg):
-    """
-    Écrit les 4 fichiers de config DarkflameServer depuis la config chargée.
-    """
     print("\n[=] Écriture de la configuration...")
     os.makedirs(BUILD_DIR, exist_ok=True)
-
     raw_lines = []
     for section in cfg.sections():
         raw_lines.append(f"[{section}]")
@@ -505,7 +508,6 @@ def write_config(cfg):
             raw_lines.append(f"{key}={val}")
         raw_lines.append("")
     raw = "\n".join(raw_lines)
-
     for config_name in ["authconfig.ini", "masterconfig.ini", "worldconfig.ini", "chatconfig.ini"]:
         dest = os.path.join(BUILD_DIR, config_name)
         with open(dest, "w") as f:
@@ -528,21 +530,15 @@ def check_client_files(cfg):
 
 
 def start_server():
-    """
-    Démarre MasterServer avec GLIBC compat si nécessaire.
-    """
     print("\n[=] Démarrage de Darkflame Universe...")
     master = find_binary("master")
     if master is None:
         print(f"[!] ERREUR : MasterServer introuvable dans {BUILD_DIR}")
         sys.exit(1)
-
     if needs_glibc_compat():
         setup_glibc_compat()
-
     if os.path.isdir(GLIBC_DIR):
         setup_ld_library_path()
-
     print(f"[✓] Lancement de {master}")
     os.chdir(BUILD_DIR)
     os.execve(master, [master], os.environ)
@@ -564,7 +560,7 @@ def main():
     check_client_files(cfg)
     test_db_connection(cfg)
     write_config(cfg)
-    setup_server_data(cfg)   # ← copie navmeshes, res, locale
+    setup_server_data(cfg)
     start_server()
 
 
