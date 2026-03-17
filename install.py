@@ -50,8 +50,6 @@ GLIBC_DIR    = os.path.join(HOME_DIR, "glibc-compat")
 PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
-
-# Fichier flag : création de compte en attente (DB pas encore migrée)
 PENDING_ACCOUNT_FLAG = os.path.join(HOME_DIR, ".pending_first_account")
 
 DFS_TARBALL_URL = "https://github.com/DarkflameUniverse/DarkflameServer/archive/refs/heads/main.tar.gz"
@@ -153,34 +151,23 @@ def create_account(cfg, username: str, password: str, gm_level: int = 9, with_pl
 # ---------------------------------------------------------------------------
 
 def setup_first_account(cfg):
-    """
-    Logique en 2 passes :
-    - Pass 1 (DB vide/pas migrée) : écrit un flag .pending_first_account et continue
-      pour laisser MasterServer jouer les migrations.
-    - Pass 2 (redémarrage suivant, tables présentes) : lit le flag, crée le compte, supprime le flag.
-    """
     admin_user = os.environ.get("ADMIN_USERNAME", "").strip()
     admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
 
     if not admin_user or not admin_pass:
-        # Pas de variables d'env → rien à faire automatiquement
         if os.path.isfile(PENDING_ACCOUNT_FLAG):
             os.remove(PENDING_ACCOUNT_FLAG)
         return
 
-    # Vérifier si les tables sont prêtes
     tables_ok = db_tables_ready(cfg)
 
     if not tables_ok:
-        # Tables absentes → 1er vrai démarrage, MasterServer va les créer
         print("[=] Tables DB absentes (première migration) → MasterServer va les créer.")
         print(f"[=] Compte '{admin_user}' sera créé automatiquement au prochain démarrage.")
-        # Sauvegarder les infos dans le flag pour la prochaine fois
         with open(PENDING_ACCOUNT_FLAG, 'w') as f:
             f.write(f"{admin_user}\n{admin_pass}\n9\n")
         return
 
-    # Tables présentes : vérifier s'il y a un compte en attente OU si la DB est vide
     conn = get_db_conn(cfg)
     try:
         with conn.cursor() as cur:
@@ -191,25 +178,22 @@ def setup_first_account(cfg):
 
     if count > 0:
         print(f"[✓] {count} compte(s) existant(s) en DB, skip création admin.")
-        # Nettoyer le flag si présent
         if os.path.isfile(PENDING_ACCOUNT_FLAG):
             os.remove(PENDING_ACCOUNT_FLAG)
         return
 
-    # DB vide et tables prêtes → créer le compte admin maintenant
     print("\n" + "=" * 50)
     print(" CRÉATION DU COMPTE ADMINISTRATEUR")
     print("=" * 50)
 
-    # Récupérer les infos depuis le flag si dispo, sinon depuis les env vars
     username, password, gm_level = admin_user, admin_pass, 9
     if os.path.isfile(PENDING_ACCOUNT_FLAG):
         try:
             lines = open(PENDING_ACCOUNT_FLAG).read().splitlines()
             if len(lines) >= 3:
-                username  = lines[0].strip() or admin_user
-                password  = lines[1].strip() or admin_pass
-                gm_level  = int(lines[2].strip())
+                username = lines[0].strip() or admin_user
+                password = lines[1].strip() or admin_pass
+                gm_level = int(lines[2].strip())
         except Exception:
             pass
 
@@ -225,10 +209,6 @@ def setup_first_account(cfg):
 # ---------------------------------------------------------------------------
 
 def cmd_add_account(cfg, args):
-    """
-    Usage : python install.py --add-account <nom> <mdp> [--gm <niveau>]
-    Niveaux GM : 0=joueur, 1=junior moderateur, 3=moderateur, 5=operateur, 9=mythran(admin)
-    """
     if len(args) < 2:
         print("Usage : python install.py --add-account <nom> <mdp> [--gm <niveau>]")
         print("  --gm 0  = joueur normal (défaut)")
@@ -856,7 +836,7 @@ def check_client_files(cfg):
     if not os.path.isdir(client_path):
         print(f"[!] ERREUR : client introuvable à {client_path}")
         sys.exit(1)
-    required = ["res/cdclient.fdb", "locale/locale.xml")
+    required = ["res/cdclient.fdb", "locale/locale.xml"]
     missing = [f for f in required if not os.path.isfile(os.path.join(client_path, f))]
     if missing:
         print(f"[!] Fichiers client manquants : {', '.join(missing)}")
@@ -880,7 +860,6 @@ def start_server():
 
 
 def main():
-    # --- Commande --add-account ---
     if "--add-account" in sys.argv:
         idx = sys.argv.index("--add-account")
         extra_args = sys.argv[idx + 1:]
@@ -905,7 +884,7 @@ def main():
     test_db_connection(cfg)
     write_config(cfg)
     setup_server_data(cfg)
-    setup_first_account(cfg)   # <-- gère les 2 passes (DB vide puis DB migrée)
+    setup_first_account(cfg)
     start_server()
 
 
