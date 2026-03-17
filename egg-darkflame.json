@@ -4,7 +4,7 @@
     "version": "PTDL_v2",
     "update_url": null
   },
-  "exported_at": "2026-03-16T00:00:00+00:00",
+  "exported_at": "2026-03-17T00:00:00+00:00",
   "name": "Darkflame Universe",
   "author": "theo7791l",
   "description": "Serveur Darkflame Universe (LEGO Universe) avec DB externe sur container Python",
@@ -81,6 +81,141 @@
       "user_viewable": true,
       "user_editable": true,
       "rules": "required|string|max:255"
+    },
+    {
+      "name": "External IP",
+      "description": "IP publique du serveur — OBLIGATOIRE pour que les clients puissent se connecter",
+      "env_variable": "EXTERNAL_IP",
+      "default_value": "0.0.0.0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:255"
+    },
+    {
+      "name": "Auth Server Port",
+      "description": "Port du serveur d'authentification",
+      "env_variable": "AUTH_SERVER_PORT",
+      "default_value": "25896",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|numeric"
+    },
+    {
+      "name": "World Server Port",
+      "description": "Port principal du serveur de jeu",
+      "env_variable": "WORLD_SERVER_PORT",
+      "default_value": "25740",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|numeric"
+    },
+    {
+      "name": "World Port Start",
+      "description": "Port de départ pour les instances de monde dynamiques",
+      "env_variable": "WORLD_PORT_START",
+      "default_value": "25740",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|numeric"
+    },
+    {
+      "name": "Chat Server Port",
+      "description": "Port du serveur de chat",
+      "env_variable": "CHAT_SERVER_PORT",
+      "default_value": "25784",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|numeric"
+    },
+    {
+      "name": "Master Server Port",
+      "description": "Port du serveur master",
+      "env_variable": "MASTER_SERVER_PORT",
+      "default_value": "25846",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|numeric"
+    },
+    {
+      "name": "Use Custom FDB",
+      "description": "Utiliser un fichier FDB personnalisé (0 ou 1)",
+      "env_variable": "USE_CUSTOM_FDB",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1"
+    },
+    {
+      "name": "FDB Path",
+      "description": "Chemin vers le FDB personnalisé (si USE_CUSTOM_FDB=1)",
+      "env_variable": "FDB_PATH",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:255"
+    },
+    {
+      "name": "Max Offline Time",
+      "description": "Temps maximum hors-ligne en secondes avant kick (0 = désactivé)",
+      "env_variable": "MAX_OFFLINE_TIME",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|numeric"
+    },
+    {
+      "name": "Kick After Failed Auth",
+      "description": "Kicker le joueur après un échec d'authentification (0 ou 1)",
+      "env_variable": "KICK_AFTER_FAILED_AUTH",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1"
+    },
+    {
+      "name": "Allow Mythran Commands",
+      "description": "Autoriser les commandes Mythran/GM (0 ou 1)",
+      "env_variable": "ALLOW_MYTHRAN_COMMANDS",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1"
+    },
+    {
+      "name": "Disable Anti-Cheat",
+      "description": "Désactiver l'anti-cheat (0 ou 1, déconseillé en production)",
+      "env_variable": "DISABLE_ANTI_CHEAT",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1"
+    },
+    {
+      "name": "Log Level",
+      "description": "Niveau de log (0=off, 1=error, 2=info, 3=debug)",
+      "env_variable": "LOG_LEVEL",
+      "default_value": "2",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|numeric|min:0|max:3"
+    },
+    {
+      "name": "Log To Console",
+      "description": "Afficher les logs dans la console Pterodactyl (0 ou 1)",
+      "env_variable": "LOG_TO_CONSOLE",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1"
+    },
+    {
+      "name": "Log To File",
+      "description": "Écrire les logs dans un fichier (0 ou 1)",
+      "env_variable": "LOG_TO_FILE",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1"
     }
   ]
 }
