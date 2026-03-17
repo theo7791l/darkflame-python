@@ -65,9 +65,6 @@ def load_config():
         print(f"[!] ERREUR : {CONFIG_FILE} introuvable !")
         sys.exit(1)
 
-    raw = open(CONFIG_FILE).read()
-
-    # Injection des variables d'environnement Pterodactyl
     env_map = {
         "MYSQL_HOST":     ("Database", "mysql_host"),
         "MYSQL_PORT":     ("Database", "mysql_port"),
@@ -93,7 +90,7 @@ def load_config():
 
 
 def find_binary(name_key):
-    """Cherche un binaire dans BUILD_DIR et ses sous-dossiers immédiats (bug #10 fix)."""
+    """Cherche un binaire dans BUILD_DIR et ses sous-dossiers immédiats."""
     search_dirs = [BUILD_DIR]
     if os.path.isdir(BUILD_DIR):
         for entry in os.listdir(BUILD_DIR):
@@ -115,13 +112,12 @@ def run(cmd, cwd=None, check=True):
 
 
 def needs_glibc_compat():
-    """Retourne True si les binaires nécessitent une GLIBC plus récente (bug #4 fix)."""
+    """Retourne True si les binaires nécessitent une GLIBC plus récente."""
     master = find_binary("master")
     if master is None:
         return False
     r = subprocess.run(["ldd", master], capture_output=True, text=True)
     if r.returncode != 0:
-        # ldd a échoué → probablement GLIBC incompatible, on active le compat
         print("[!] ldd a échoué → activation GLIBC compat par précaution")
         return True
     output = r.stdout + r.stderr
@@ -138,7 +134,7 @@ def download_file(url, dest):
 def extract_so_from_tar(t, out_dir):
     """
     Extrait depuis un tarfile tous les .so et ld-linux.
-    Fix bug #2 : vérifie que la cible d'un symlink existe avant de le créer.
+    Vérifie que la cible d'un symlink existe avant de le créer.
     """
     members = t.getmembers()
 
@@ -147,10 +143,9 @@ def extract_so_from_tar(t, out_dir):
         base = os.path.basename(m.name)
         if not base:
             continue
-        is_so   = ".so" in base
-        is_ld   = base.startswith("ld-") and ".so" in base
-        is_ld_real = base.startswith("ld-") and base.endswith(".so")  # ex: ld-2.39.so
-        if not (is_so or is_ld or is_ld_real):
+        is_so      = ".so" in base
+        is_ld_real = base.startswith("ld-") and base.endswith(".so")
+        if not (is_so or is_ld_real):
             continue
         if not m.isfile():
             continue
@@ -164,18 +159,17 @@ def extract_so_from_tar(t, out_dir):
         except Exception as e:
             print(f"  [!] Erreur extraction {base}: {e}")
 
-    # Pass 2 : symlinks — uniquement si la cible existe (bug #2 fix)
+    # Pass 2 : symlinks — uniquement si la cible existe
     for m in members:
         base = os.path.basename(m.name)
         if not base or not m.issym():
             continue
         if ".so" not in base and not base.startswith("ld-"):
             continue
-        dest_path  = os.path.join(out_dir, base)
+        dest_path   = os.path.join(out_dir, base)
         link_target = os.path.basename(m.linkname)
         target_path = os.path.join(out_dir, link_target)
 
-        # Ignorer les symlinks circulaires ou dont la cible est absente
         if link_target == base:
             print(f"  [!] Symlink circulaire ignoré : {base} -> {link_target}")
             continue
@@ -244,8 +238,8 @@ def extract_deb_libs(deb_path, out_dir):
 
 def find_ld(glibc_dir):
     """
-    Retourne le chemin absolu vers ld-linux-x86-64.so.2 ou ld-2.*.so.
-    Fix bug #1 : priorité au fichier réel ld-2.*.so, détection symlinks circulaires.
+    Retourne le chemin absolu vers ld-linux ou ld-2.*.so.
+    Priorité au fichier réel, détection symlinks circulaires.
     """
     # Priorité 1 : fichier réel ld-2.*.so (ex: ld-2.39.so)
     for f in os.listdir(glibc_dir):
@@ -277,11 +271,11 @@ def find_ld(glibc_dir):
                 print(f"[✓] ld-linux fichier direct : {f}")
                 return p
 
-    # Priorité 3 : tout fichier commençant par ld-
+    # Priorité 3 : tout fichier commençant par ld- (résolution réelle)
     for f in os.listdir(glibc_dir):
         if f.startswith("ld-"):
             p = os.path.join(glibc_dir, f)
-            resolved = os.path.realpath(p)  # résout les symlinks
+            resolved = os.path.realpath(p)
             if os.path.isfile(resolved):
                 os.chmod(resolved, 0o755)
                 print(f"[✓] ld fallback : {f} -> {resolved}")
@@ -342,7 +336,6 @@ def setup_glibc_compat():
                                "src", "mariadb_connector_cpp-build")
     rpath = f"{GLIBC_DIR}:{BUILD_DIR}:{mariadb_lib}"
 
-    # Bug #7 fix : patcher tous les binaires, créer le flag UNIQUEMENT si tout réussit
     patched_count = 0
     for key in BINARY_NAMES:
         b = find_binary(key)
@@ -376,11 +369,9 @@ def setup_ld_library_path():
 
 def extract_prebuilt():
     print("\n[=] darkflame-bins.zip détecté → mode binaires pré-compilés")
-    # Bug #6 fix : utiliser un flag pour détecter extraction complète
     if os.path.isfile(EXTRACT_FLAG) and find_binary("master") is not None:
         print("[✓] Binaires déjà extraits, skip.")
         return
-    # Nettoyer en cas d'extraction partielle
     if os.path.isdir(BUILD_DIR):
         print("[=] Nettoyage extraction précédente incomplète...")
         shutil.rmtree(BUILD_DIR, ignore_errors=True)
@@ -399,9 +390,50 @@ def extract_prebuilt():
     print("[✓] Binaires extraits dans", BUILD_DIR)
 
 
+def setup_server_data(cfg):
+    """
+    Copie les dossiers/fichiers requis par DarkflameServer depuis le client
+    vers BUILD_DIR : navmeshes, res, locale.
+    Ces dossiers doivent être dans le même répertoire que les binaires.
+    """
+    print("\n[=] Vérification des données serveur (navmeshes, res, locale)...")
+    client_path = cfg.get("General", "client_location", fallback="/home/container/client")
+
+    copies = [
+        # (source dans le client,          dest dans BUILD_DIR,  obligatoire)
+        (os.path.join(client_path, "navmeshes"),              os.path.join(BUILD_DIR, "navmeshes"),  True),
+        (os.path.join(client_path, "res"),                    os.path.join(BUILD_DIR, "res"),        True),
+        (os.path.join(client_path, "locale"),                 os.path.join(BUILD_DIR, "locale"),     True),
+        # fdb peut aussi être directement à la racine du client
+        (os.path.join(client_path, "res", "cdclient.fdb"),   os.path.join(BUILD_DIR, "res", "cdclient.fdb"), False),
+    ]
+
+    for src, dst, required in copies:
+        if os.path.isdir(src):
+            if os.path.exists(dst):
+                print(f"[✓] {os.path.basename(dst)}/ déjà présent, skip.")
+            else:
+                print(f"[=] Copie {os.path.basename(src)}/ → {dst} ...")
+                shutil.copytree(src, dst)
+                print(f"[✓] {os.path.basename(src)}/ copié.")
+        elif os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if not os.path.isfile(dst):
+                shutil.copy2(src, dst)
+        else:
+            if required:
+                print(f"[!] ERREUR : {src} introuvable dans le client !")
+                sys.exit(1)
+
+    # Créer le dossier logs s'il n'existe pas (évite des warnings DarkflameServer)
+    logs_dir = os.path.join(BUILD_DIR, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
+    print("[✓] Données serveur OK.")
+
+
 def install_runtime_deps():
     print("\n[=] Vérification des dépendances runtime...")
-    # Bug #8 fix : pas de sudo dans un container Pterodactyl
     r = subprocess.run("apt-get update -qq", shell=True, capture_output=True)
     if r.returncode != 0:
         print("[!] apt-get indisponible, on continue.")
@@ -462,12 +494,10 @@ def test_db_connection(cfg):
 def write_config(cfg):
     """
     Écrit les 4 fichiers de config DarkflameServer depuis la config chargée.
-    Bug #3 fix : chaque config est écrite depuis cfg, pas copiée depuis authconfig.
     """
     print("\n[=] Écriture de la configuration...")
     os.makedirs(BUILD_DIR, exist_ok=True)
 
-    # Reconstruire le contenu INI depuis cfg
     raw_lines = []
     for section in cfg.sections():
         raw_lines.append(f"[{section}]")
@@ -497,10 +527,9 @@ def check_client_files(cfg):
     print(f"[✓] Fichiers client OK à {client_path}")
 
 
-def start_server(cfg):
+def start_server():
     """
-    Bug #5 fix : setup GLIBC compat et LD_LIBRARY_PATH de façon plus robuste.
-    On applique toujours le LD_LIBRARY_PATH si glibc-compat existe.
+    Démarre MasterServer avec GLIBC compat si nécessaire.
     """
     print("\n[=] Démarrage de Darkflame Universe...")
     master = find_binary("master")
@@ -508,11 +537,9 @@ def start_server(cfg):
         print(f"[!] ERREUR : MasterServer introuvable dans {BUILD_DIR}")
         sys.exit(1)
 
-    # Appliquer GLIBC compat si nécessaire
     if needs_glibc_compat():
         setup_glibc_compat()
 
-    # Toujours configurer LD_LIBRARY_PATH si glibc-compat existe
     if os.path.isdir(GLIBC_DIR):
         setup_ld_library_path()
 
@@ -537,7 +564,8 @@ def main():
     check_client_files(cfg)
     test_db_connection(cfg)
     write_config(cfg)
-    start_server(cfg)
+    setup_server_data(cfg)   # ← copie navmeshes, res, locale
+    start_server()
 
 
 if __name__ == "__main__":
