@@ -96,7 +96,6 @@ def hash_password(plain: str) -> str:
 
 
 def db_tables_ready(cfg) -> bool:
-    """Retourne True si les tables accounts ET play_keys existent déjà."""
     conn = get_db_conn(cfg)
     try:
         with conn.cursor() as cur:
@@ -806,8 +805,11 @@ def write_config(cfg):
         f"\n"
     )
 
+    # listening_ip=0.0.0.0 force tous les serveurs à écouter sur toutes les interfaces
+    # sans ça DarkflameServer bind uniquement sur localhost et le client world time out
     networking_base = (
         f"external_ip={external_ip}\n"
+        f"listening_ip=0.0.0.0\n"
         f"auth_server_port={auth_port}\n"
         f"world_server_port={world_port}\n"
         f"world_port_start={world_port_start}\n"
