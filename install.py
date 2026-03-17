@@ -43,8 +43,13 @@ EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
 
 # Tarball du repo DarkflameServer (branch main)
 DFS_TARBALL_URL = "https://github.com/DarkflameUniverse/DarkflameServer/archive/refs/heads/main.tar.gz"
-# Flag pour ne pas re-télécharger le tarball à chaque restart
-DFS_RESOURCES_FLAG = os.path.join(HOME_DIR, ".dfs_resources_ok")
+
+# Dossiers à copier directement depuis le tarball vers BUILD_DIR
+# Format : (chemin_dans_tarball, chemin_dest_dans_BUILD_DIR)
+DFS_PLAIN_DIRS = [
+    ("migrations", "migrations"),
+    ("vanity",     "vanity"),
+]
 
 BINARY_NAMES = {
     "master": ["MasterServer", "masterserver"],
@@ -369,20 +374,45 @@ def extract_prebuilt():
     print("[✓] Binaires extraits dans", BUILD_DIR)
 
 
+def _extract_dir_from_tar(t, members, src_prefix, dest_dir):
+    """Extrait un dossier depuis un tarball ouvert vers dest_dir."""
+    os.makedirs(dest_dir, exist_ok=True)
+    count = 0
+    for m in members:
+        if not m.name.startswith(src_prefix):
+            continue
+        rel = m.name[len(src_prefix):]
+        if not rel:
+            continue
+        dest_path = os.path.join(dest_dir, rel)
+        if m.isdir():
+            os.makedirs(dest_path, exist_ok=True)
+        elif m.isfile():
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            src = t.extractfile(m)
+            if src:
+                with open(dest_path, 'wb') as f:
+                    shutil.copyfileobj(src, f)
+                count += 1
+    return count
+
+
 def fetch_repo_resources():
     """
     Télécharge le tarball de DarkflameServer et en extrait :
-      - migrations/       → BUILD_DIR/migrations/
-      - resources/navmeshes.zip → extrait les .bin dans BUILD_DIR/navmeshes/
-    
-    N'est exécuté qu'une seule fois (flag .dfs_resources_ok).
+      - Tous les dossiers listés dans DFS_PLAIN_DIRS  → BUILD_DIR/<dest>/
+      - resources/navmeshes.zip                       → BUILD_DIR/navmeshes/ (fichiers .bin)
+    Ne re-télécharge le tarball que si au moins un dossier est manquant.
     """
-    need_migrations = not os.path.isdir(os.path.join(BUILD_DIR, "migrations"))
-    need_navmeshes  = not (os.path.isdir(os.path.join(BUILD_DIR, "navmeshes"))
-                          and any(f.endswith(".bin") for f in os.listdir(os.path.join(BUILD_DIR, "navmeshes"))))
+    # Vérifie ce qui est déjà présent
+    missing_dirs = [(src, dst) for src, dst in DFS_PLAIN_DIRS
+                    if not os.path.isdir(os.path.join(BUILD_DIR, dst))]
+    nav_dir = os.path.join(BUILD_DIR, "navmeshes")
+    need_navmeshes = not (os.path.isdir(nav_dir)
+                          and any(f.endswith(".bin") for f in os.listdir(nav_dir)))
 
-    if not need_migrations and not need_navmeshes:
-        print("[✓] migrations/ et navmeshes/ déjà présents, skip.")
+    if not missing_dirs and not need_navmeshes:
+        print("[✓] Tous les dossiers repo déjà présents (migrations, vanity, navmeshes), skip.")
         return
 
     tar_path = os.path.join(HOME_DIR, "dfs-main.tar.gz")
@@ -397,7 +427,7 @@ def fetch_repo_resources():
     with tarfile.open(tar_path, 'r:gz') as t:
         members = t.getmembers()
 
-        # Détermine le préfixe du répertoire racine (DarkflameServer-main/)
+        # Détermine le préfixe racine (ex: "DarkflameServer-main/")
         root_prefix = ""
         for m in members:
             parts = m.name.split('/')
@@ -405,44 +435,29 @@ def fetch_repo_resources():
                 root_prefix = parts[0] + "/"
                 break
 
-        if need_migrations:
-            mig_dest = os.path.join(BUILD_DIR, "migrations")
-            os.makedirs(mig_dest, exist_ok=True)
-            mig_prefix = root_prefix + "migrations/"
-            extracted = 0
-            for m in members:
-                if not m.name.startswith(mig_prefix):
-                    continue
-                rel = m.name[len(mig_prefix):]
-                if not rel:
-                    continue
-                dest_path = os.path.join(mig_dest, rel)
-                if m.isdir():
-                    os.makedirs(dest_path, exist_ok=True)
-                elif m.isfile():
-                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                    src = t.extractfile(m)
-                    if src:
-                        with open(dest_path, 'wb') as f:
-                            shutil.copyfileobj(src, f)
-                        extracted += 1
-            print(f"[✓] migrations/ : {extracted} fichier(s) extrait(s)")
+        # Extraction des dossiers simples
+        for src_name, dst_name in missing_dirs:
+            src_prefix = root_prefix + src_name + "/"
+            dest_dir   = os.path.join(BUILD_DIR, dst_name)
+            count = _extract_dir_from_tar(t, members, src_prefix, dest_dir)
+            print(f"[✓] {dst_name}/ : {count} fichier(s) extrait(s)")
 
+        # Extraction navmeshes depuis resources/navmeshes.zip
         if need_navmeshes:
-            nav_zip_member = root_prefix + "resources/navmeshes.zip"
-            nav_member = next((m for m in members if m.name == nav_zip_member), None)
+            nav_zip_path = root_prefix + "resources/navmeshes.zip"
+            nav_member = next((m for m in members if m.name == nav_zip_path), None)
             if nav_member:
                 nav_zip_data = t.extractfile(nav_member).read()
-                nav_dest = os.path.join(BUILD_DIR, "navmeshes")
-                os.makedirs(nav_dest, exist_ok=True)
+                os.makedirs(nav_dir, exist_ok=True)
                 with zipfile.ZipFile(io.BytesIO(nav_zip_data)) as z:
-                    bin_count = 0
-                    for name in z.namelist():
-                        fname = os.path.basename(name)
-                        if fname.endswith(".bin"):
-                            with z.open(name) as src, open(os.path.join(nav_dest, fname), 'wb') as out:
-                                shutil.copyfileobj(src, out)
-                            bin_count += 1
+                    bin_count = sum(
+                        1 for name in z.namelist()
+                        if name.endswith(".bin") and not open(
+                            os.path.join(nav_dir, os.path.basename(name)), 'wb'
+                        ).write(z.read(name))
+                    )
+                    # recompte proprement
+                    bin_count = len([f for f in os.listdir(nav_dir) if f.endswith(".bin")])
                 print(f"[✓] navmeshes/ : {bin_count} fichier(s) .bin extrait(s)")
             else:
                 print("[!] resources/navmeshes.zip introuvable dans le tarball")
@@ -452,10 +467,6 @@ def fetch_repo_resources():
 
 
 def setup_server_data(cfg):
-    """
-    - Copie res/ et locale/ depuis le client vers BUILD_DIR
-    - Télécharge migrations/ et navmeshes/ depuis DarkflameServer
-    """
     print("\n[=] Vérification des données serveur...")
     client_path = cfg.get("General", "client_location", fallback="/home/container/client")
 
