@@ -41,8 +41,10 @@ PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
 
-# navmeshes.zip téléchargé depuis le repo DarkflameServer (resources/)
-NAVMESHES_URL = "https://github.com/DarkflameUniverse/DarkflameServer/raw/main/resources/navmeshes.zip"
+# Tarball du repo DarkflameServer (branch main)
+DFS_TARBALL_URL = "https://github.com/DarkflameUniverse/DarkflameServer/archive/refs/heads/main.tar.gz"
+# Flag pour ne pas re-télécharger le tarball à chaque restart
+DFS_RESOURCES_FLAG = os.path.join(HOME_DIR, ".dfs_resources_ok")
 
 BINARY_NAMES = {
     "master": ["MasterServer", "masterserver"],
@@ -123,7 +125,7 @@ def needs_glibc_compat():
 def download_file(url, dest):
     print(f"[=] Téléchargement {url.split('/')[-1]}...")
     req = urllib.request.Request(url, headers={"User-Agent": "Wget/1.21"})
-    with urllib.request.urlopen(req, timeout=60) as r, open(dest, 'wb') as f:
+    with urllib.request.urlopen(req, timeout=120) as r, open(dest, 'wb') as f:
         shutil.copyfileobj(r, f)
 
 
@@ -367,57 +369,96 @@ def extract_prebuilt():
     print("[✓] Binaires extraits dans", BUILD_DIR)
 
 
-def fetch_navmeshes():
+def fetch_repo_resources():
     """
-    Télécharge resources/navmeshes.zip depuis DarkflameServer
-    et extrait les .bin dans BUILD_DIR/res/maps/navmeshes/
+    Télécharge le tarball de DarkflameServer et en extrait :
+      - migrations/       → BUILD_DIR/migrations/
+      - resources/navmeshes.zip → extrait les .bin dans BUILD_DIR/navmeshes/
     
-    La vérification se fait sur le dossier final attendu par MasterServer :
-      darkflame-build/navmeshes/   (chemin vérifié par MasterServer.cpp:112)
+    N'est exécuté qu'une seule fois (flag .dfs_resources_ok).
     """
-    # MasterServer cherche navmeshes/ à côté du binaire (dans BUILD_DIR)
-    dest = os.path.join(BUILD_DIR, "navmeshes")
-    if os.path.isdir(dest) and any(f.endswith(".bin") for f in os.listdir(dest)):
-        print("[✓] navmeshes/ déjà présent, skip.")
+    need_migrations = not os.path.isdir(os.path.join(BUILD_DIR, "migrations"))
+    need_navmeshes  = not (os.path.isdir(os.path.join(BUILD_DIR, "navmeshes"))
+                          and any(f.endswith(".bin") for f in os.listdir(os.path.join(BUILD_DIR, "navmeshes"))))
+
+    if not need_migrations and not need_navmeshes:
+        print("[✓] migrations/ et navmeshes/ déjà présents, skip.")
         return
 
-    print("[=] Téléchargement navmeshes.zip depuis DarkflameServer/resources...")
-    zip_path = os.path.join(HOME_DIR, "navmeshes.zip")
+    tar_path = os.path.join(HOME_DIR, "dfs-main.tar.gz")
+    print("[=] Téléchargement DarkflameServer (tarball)...")
     try:
-        download_file(NAVMESHES_URL, zip_path)
+        download_file(DFS_TARBALL_URL, tar_path)
     except Exception as e:
-        print(f"[!] Échec téléchargement navmeshes.zip : {e}")
+        print(f"[!] Échec téléchargement tarball DarkflameServer : {e}")
         sys.exit(1)
 
-    os.makedirs(dest, exist_ok=True)
-    print(f"[=] Extraction navmeshes.zip → {dest} ...")
-    with zipfile.ZipFile(zip_path, 'r') as z:
-        for member in z.namelist():
-            filename = os.path.basename(member)
-            if not filename or not filename.endswith(".bin"):
-                continue
-            with z.open(member) as src, open(os.path.join(dest, filename), 'wb') as out:
-                shutil.copyfileobj(src, out)
+    print("[=] Extraction depuis le tarball...")
+    with tarfile.open(tar_path, 'r:gz') as t:
+        members = t.getmembers()
 
-    bin_count = len([f for f in os.listdir(dest) if f.endswith(".bin")])
-    os.remove(zip_path)
+        # Détermine le préfixe du répertoire racine (DarkflameServer-main/)
+        root_prefix = ""
+        for m in members:
+            parts = m.name.split('/')
+            if len(parts) >= 2:
+                root_prefix = parts[0] + "/"
+                break
 
-    if bin_count == 0:
-        print("[!] ERREUR : navmeshes.zip ne contenait aucun .bin !")
-        sys.exit(1)
+        if need_migrations:
+            mig_dest = os.path.join(BUILD_DIR, "migrations")
+            os.makedirs(mig_dest, exist_ok=True)
+            mig_prefix = root_prefix + "migrations/"
+            extracted = 0
+            for m in members:
+                if not m.name.startswith(mig_prefix):
+                    continue
+                rel = m.name[len(mig_prefix):]
+                if not rel:
+                    continue
+                dest_path = os.path.join(mig_dest, rel)
+                if m.isdir():
+                    os.makedirs(dest_path, exist_ok=True)
+                elif m.isfile():
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    src = t.extractfile(m)
+                    if src:
+                        with open(dest_path, 'wb') as f:
+                            shutil.copyfileobj(src, f)
+                        extracted += 1
+            print(f"[✓] migrations/ : {extracted} fichier(s) extrait(s)")
 
-    print(f"[✓] {bin_count} navmesh(es) extrait(s) dans {dest}")
+        if need_navmeshes:
+            nav_zip_member = root_prefix + "resources/navmeshes.zip"
+            nav_member = next((m for m in members if m.name == nav_zip_member), None)
+            if nav_member:
+                nav_zip_data = t.extractfile(nav_member).read()
+                nav_dest = os.path.join(BUILD_DIR, "navmeshes")
+                os.makedirs(nav_dest, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(nav_zip_data)) as z:
+                    bin_count = 0
+                    for name in z.namelist():
+                        fname = os.path.basename(name)
+                        if fname.endswith(".bin"):
+                            with z.open(name) as src, open(os.path.join(nav_dest, fname), 'wb') as out:
+                                shutil.copyfileobj(src, out)
+                            bin_count += 1
+                print(f"[✓] navmeshes/ : {bin_count} fichier(s) .bin extrait(s)")
+            else:
+                print("[!] resources/navmeshes.zip introuvable dans le tarball")
+
+    os.remove(tar_path)
+    print("[✓] Ressources DarkflameServer OK.")
 
 
 def setup_server_data(cfg):
     """
-    Copie res/ et locale/ depuis le client vers BUILD_DIR.
-    Télécharge et extrait navmeshes/ depuis DarkflameServer/resources/navmeshes.zip.
+    - Copie res/ et locale/ depuis le client vers BUILD_DIR
+    - Télécharge migrations/ et navmeshes/ depuis DarkflameServer
     """
-    print("\n[=] Vérification des données serveur (navmeshes, res, locale)...")
+    print("\n[=] Vérification des données serveur...")
     client_path = cfg.get("General", "client_location", fallback="/home/container/client")
 
-    # res/ et locale/ viennent du client LEGO Universe
     client_copies = [
         (os.path.join(client_path, "res"),    os.path.join(BUILD_DIR, "res")),
         (os.path.join(client_path, "locale"), os.path.join(BUILD_DIR, "locale")),
@@ -434,12 +475,9 @@ def setup_server_data(cfg):
             print(f"[!] ERREUR : {src} introuvable dans le client !")
             sys.exit(1)
 
-    # navmeshes vient de DarkflameServer/resources/navmeshes.zip
-    fetch_navmeshes()
+    fetch_repo_resources()
 
-    # Créer le dossier logs
     os.makedirs(os.path.join(BUILD_DIR, "logs"), exist_ok=True)
-
     print("[✓] Données serveur OK.")
 
 
