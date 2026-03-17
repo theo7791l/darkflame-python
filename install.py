@@ -51,6 +51,9 @@ PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
 
+# Fichier flag : création de compte en attente (DB pas encore migrée)
+PENDING_ACCOUNT_FLAG = os.path.join(HOME_DIR, ".pending_first_account")
+
 DFS_TARBALL_URL = "https://github.com/DarkflameUniverse/DarkflameServer/archive/refs/heads/main.tar.gz"
 
 DFS_PLAIN_DIRS = [
@@ -91,12 +94,25 @@ def get_db_conn(cfg):
 
 
 def hash_password(plain: str) -> str:
-    """Retourne le hash bcrypt compatible DarkflameServer."""
     return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
+def db_tables_ready(cfg) -> bool:
+    """Retourne True si les tables accounts ET play_keys existent déjà."""
+    conn = get_db_conn(cfg)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema = %s AND table_name IN ('accounts', 'play_keys');",
+                (cfg.get("Database", "mysql_database"),)
+            )
+            return cur.fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
 def create_play_key(cursor) -> int:
-    """Insère une nouvelle play key active et retourne son id."""
     key_string = str(uuid.uuid4()).upper()[:20]
     cursor.execute(
         "INSERT INTO play_keys (key_string, created_at, key_uses, active) VALUES (%s, NOW(), 99, 1);",
@@ -106,21 +122,14 @@ def create_play_key(cursor) -> int:
 
 
 def create_account(cfg, username: str, password: str, gm_level: int = 9, with_play_key: bool = True):
-    """
-    Crée un compte DarkflameServer avec bcrypt + play key auto.
-    gm_level : 9 = Mythran (admin), 0 = joueur normal
-    """
     conn = get_db_conn(cfg)
     try:
         with conn.cursor() as cur:
-            # Vérifier si le compte existe déjà
             cur.execute("SELECT id FROM accounts WHERE name = %s LIMIT 1;", (username,))
             if cur.fetchone():
                 print(f"[!] Le compte '{username}' existe déjà, skip.")
                 return False
-
             hashed = hash_password(password)
-
             if with_play_key:
                 play_key_id = create_play_key(cur)
                 cur.execute(
@@ -134,21 +143,44 @@ def create_account(cfg, username: str, password: str, gm_level: int = 9, with_pl
                     (username, hashed, gm_level)
                 )
                 print(f"[✓] Compte '{username}' créé (gm_level={gm_level}, sans play key).")
-
         return True
     finally:
         conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Création du premier compte admin (premier démarrage)
+# Création du premier compte admin
 # ---------------------------------------------------------------------------
 
 def setup_first_account(cfg):
     """
-    Si aucun compte n'existe en DB, demande de créer un compte admin
-    avec play key attribuée automatiquement.
+    Logique en 2 passes :
+    - Pass 1 (DB vide/pas migrée) : écrit un flag .pending_first_account et continue
+      pour laisser MasterServer jouer les migrations.
+    - Pass 2 (redémarrage suivant, tables présentes) : lit le flag, crée le compte, supprime le flag.
     """
+    admin_user = os.environ.get("ADMIN_USERNAME", "").strip()
+    admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
+
+    if not admin_user or not admin_pass:
+        # Pas de variables d'env → rien à faire automatiquement
+        if os.path.isfile(PENDING_ACCOUNT_FLAG):
+            os.remove(PENDING_ACCOUNT_FLAG)
+        return
+
+    # Vérifier si les tables sont prêtes
+    tables_ok = db_tables_ready(cfg)
+
+    if not tables_ok:
+        # Tables absentes → 1er vrai démarrage, MasterServer va les créer
+        print("[=] Tables DB absentes (première migration) → MasterServer va les créer.")
+        print(f"[=] Compte '{admin_user}' sera créé automatiquement au prochain démarrage.")
+        # Sauvegarder les infos dans le flag pour la prochaine fois
+        with open(PENDING_ACCOUNT_FLAG, 'w') as f:
+            f.write(f"{admin_user}\n{admin_pass}\n9\n")
+        return
+
+    # Tables présentes : vérifier s'il y a un compte en attente OU si la DB est vide
     conn = get_db_conn(cfg)
     try:
         with conn.cursor() as cur:
@@ -159,25 +191,33 @@ def setup_first_account(cfg):
 
     if count > 0:
         print(f"[✓] {count} compte(s) existant(s) en DB, skip création admin.")
+        # Nettoyer le flag si présent
+        if os.path.isfile(PENDING_ACCOUNT_FLAG):
+            os.remove(PENDING_ACCOUNT_FLAG)
         return
 
+    # DB vide et tables prêtes → créer le compte admin maintenant
     print("\n" + "=" * 50)
-    print(" PREMIER DÉMARRAGE — Création du compte administrateur")
+    print(" CRÉATION DU COMPTE ADMINISTRATEUR")
     print("=" * 50)
 
-    admin_user = os.environ.get("ADMIN_USERNAME", "").strip()
-    admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
+    # Récupérer les infos depuis le flag si dispo, sinon depuis les env vars
+    username, password, gm_level = admin_user, admin_pass, 9
+    if os.path.isfile(PENDING_ACCOUNT_FLAG):
+        try:
+            lines = open(PENDING_ACCOUNT_FLAG).read().splitlines()
+            if len(lines) >= 3:
+                username  = lines[0].strip() or admin_user
+                password  = lines[1].strip() or admin_pass
+                gm_level  = int(lines[2].strip())
+        except Exception:
+            pass
 
-    if admin_user and admin_pass:
-        print(f"[=] Création auto depuis les variables d'env (ADMIN_USERNAME / ADMIN_PASSWORD)...")
-    else:
-        print("[=] Aucune variable ADMIN_USERNAME/ADMIN_PASSWORD détectée.")
-        print("[=] Définissez ces variables d'env dans Pterodactyl pour créer un admin auto.")
-        print("[!] Aucun compte créé. Utilisez : python install.py --add-account <nom> <mdp>")
-        return
-
-    create_account(cfg, admin_user, admin_pass, gm_level=9, with_play_key=True)
+    create_account(cfg, username, password, gm_level=gm_level, with_play_key=True)
     print("[✓] Compte admin prêt — vous pouvez vous connecter directement.")
+
+    if os.path.isfile(PENDING_ACCOUNT_FLAG):
+        os.remove(PENDING_ACCOUNT_FLAG)
 
 
 # ---------------------------------------------------------------------------
@@ -207,9 +247,12 @@ def cmd_add_account(cfg, args):
             except ValueError:
                 print("[!] Niveau GM invalide, utilisation de 0.")
 
+    if not db_tables_ready(cfg):
+        print("[!] ERREUR : les tables DB n'existent pas encore.")
+        print("[!] Démarrez le serveur une fois pour jouer les migrations, puis réessayez.")
+        sys.exit(1)
+
     print(f"\n[=] Création du compte '{username}' (gm_level={gm_level})...")
-    cfg = load_config()
-    test_db_connection(cfg)
     success = create_account(cfg, username, password, gm_level=gm_level, with_play_key=True)
     if success:
         print(f"[✓] Compte '{username}' créé avec play key auto.")
@@ -221,7 +264,6 @@ def cmd_add_account(cfg, args):
 # ---------------------------------------------------------------------------
 
 def refresh_config_template():
-    """Toujours écraser config_template.ini depuis le repo cloné pour éviter les sections périmées."""
     repo_cfg = os.path.join(REPO_DIR, "config_template.ini")
     if os.path.isfile(repo_cfg):
         shutil.copy2(repo_cfg, CONFIG_FILE)
@@ -235,31 +277,26 @@ def load_config():
     refresh_config_template()
 
     env_map = {
-        # Database
         "MYSQL_HOST":             ("Database",   "mysql_host"),
         "MYSQL_PORT":             ("Database",   "mysql_port"),
         "MYSQL_DATABASE":         ("Database",   "mysql_database"),
         "MYSQL_USER":             ("Database",   "mysql_username"),
         "MYSQL_PASSWORD":         ("Database",   "mysql_password"),
-        # General
         "CLIENT_PATH":            ("General",    "client_location"),
         "USE_CUSTOM_FDB":         ("General",    "use_custom_fdb"),
         "FDB_PATH":               ("General",    "fdb_path"),
-        # Networking
         "EXTERNAL_IP":            ("Networking", "external_ip"),
         "AUTH_SERVER_PORT":       ("Networking", "auth_server_port"),
         "WORLD_SERVER_PORT":      ("Networking", "world_server_port"),
         "WORLD_PORT_START":       ("Networking", "world_port_start"),
         "CHAT_SERVER_PORT":       ("Networking", "chat_server_port"),
         "MASTER_SERVER_PORT":     ("Networking", "master_server_port"),
-        # Gameplay
         "MAX_OFFLINE_TIME":       ("Gameplay",   "max_offline_time"),
         "KICK_AFTER_FAILED_AUTH": ("Gameplay",   "kick_after_failed_auth"),
         "ALLOW_MYTHRAN_COMMANDS": ("Gameplay",   "allow_mythran_commands"),
         "DISABLE_ANTI_CHEAT":     ("Gameplay",   "disable_anti_cheat"),
         "CHATBOT_ENABLED":        ("Gameplay",   "chatbot_enabled"),
         "LOG_ACTIVITY":           ("Gameplay",   "log_activity"),
-        # Logging
         "LOG_LEVEL":              ("Logging",    "log_level"),
         "LOG_TO_CONSOLE":         ("Logging",    "log_to_console"),
         "LOG_TO_FILE":            ("Logging",    "log_to_file"),
@@ -819,7 +856,7 @@ def check_client_files(cfg):
     if not os.path.isdir(client_path):
         print(f"[!] ERREUR : client introuvable à {client_path}")
         sys.exit(1)
-    required = ["res/cdclient.fdb", "locale/locale.xml"]
+    required = ["res/cdclient.fdb", "locale/locale.xml")
     missing = [f for f in required if not os.path.isfile(os.path.join(client_path, f))]
     if missing:
         print(f"[!] Fichiers client manquants : {', '.join(missing)}")
@@ -850,7 +887,7 @@ def main():
         cfg = load_config()
         test_db_connection(cfg)
         cmd_add_account(cfg, extra_args)
-        return  # sys.exit appelé dans cmd_add_account
+        return
 
     print("===================================================")
     print(" Darkflame Universe - Pterodactyl Python Container")
@@ -868,7 +905,7 @@ def main():
     test_db_connection(cfg)
     write_config(cfg)
     setup_server_data(cfg)
-    setup_first_account(cfg)   # <-- création auto admin au premier démarrage
+    setup_first_account(cfg)   # <-- gère les 2 passes (DB vide puis DB migrée)
     start_server()
 
 
