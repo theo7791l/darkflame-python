@@ -74,17 +74,14 @@ GLIBC_DEBS = [
 ]
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
-# Ports ouverts sur le container :
-#   25896 -> Auth
-#   25846 -> Master
-#   25784 -> Chat
-#   25740 -> World zone 1000 instance 1  (start + 1*3 = 25737+3)
-# world_port_start = 25740 - 3 = 25737
-DEFAULT_AUTH_PORT    = "25896"
-DEFAULT_MASTER_PORT  = "25846"
-DEFAULT_CHAT_PORT    = "25784"
-DEFAULT_WORLD_PORT   = "25740"
-DEFAULT_WPS          = "25737"
+# Ports ouverts : 25896 Auth, 25846 Master, 25784 Chat, 25740 World zone 1000
+# DFS formule : port = start + 1 + (instance_id * 3)
+# Zone 1000 instance 1 = 25736 + 1 + 3 = 25740
+DEFAULT_AUTH_PORT   = "25896"
+DEFAULT_MASTER_PORT = "25846"
+DEFAULT_CHAT_PORT   = "25784"
+DEFAULT_WORLD_PORT  = "25740"
+DEFAULT_WPS         = "25736"
 
 
 # ---------------------------------------------------------------------------
@@ -775,16 +772,11 @@ def write_config(cfg):
     log_to_console = _cfg_get(cfg, "Logging", "log_to_console", "1")
     log_to_file    = _cfg_get(cfg, "Logging", "log_to_file",    "0")
 
-    wps_int = int(world_port_start)
     print(f"[=] external_ip        = {external_ip}")
     print(f"[=] auth_server_port   = {auth_port}")
     print(f"[=] master_server_port = {master_port}")
     print(f"[=] chat_server_port   = {chat_port}")
     print(f"[=] world_port_start   = {world_port_start}")
-    print(f"[=]   zone 0  inst 0   = {wps_int + 0*3} (interne)")
-    print(f"[=]   zone 1000 inst 1 = {wps_int + 1*3} (port ouvert = 25740 ?)")
-    if wps_int + 3 != 25740:
-        print(f"[!] ATTENTION : zone 1000 utilisera le port {wps_int+3}, pas 25740 !")
 
     if external_ip == "0.0.0.0":
         print("[!] ATTENTION : external_ip=0.0.0.0 — ajoutez EXTERNAL_IP dans Pterodactyl.")
