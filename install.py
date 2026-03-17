@@ -15,7 +15,7 @@ import urllib.request
 import tarfile
 import io
 import time
-import signal
+import glob
 
 def pip_install(pkg):
     subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
@@ -44,6 +44,7 @@ PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
 PLAYIT_BIN   = os.path.join(HOME_DIR, "playit")
+PLAYIT_DIR   = os.path.join(HOME_DIR, "playit-data")
 PLAYIT_URL   = "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64"
 
 DFS_TARBALL_URL = "https://github.com/DarkflameUniverse/DarkflameServer/archive/refs/heads/main.tar.gz"
@@ -628,12 +629,37 @@ def check_client_files(cfg):
     print(f"[✓] Fichiers client OK à {client_path}")
 
 
+def _search_claim_in_files(search_dirs):
+    """Cherche un claim URL dans tous les fichiers texte de search_dirs."""
+    claim_url = None
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, 'r', errors='replace') as f:
+                        content = f.read()
+                    if 'playit.gg/claim' in content:
+                        for line in content.splitlines():
+                            if 'playit.gg/claim' in line:
+                                claim_url = line.strip()
+                                break
+                    if claim_url:
+                        print(f"[=] Claim trouvé dans : {fpath}")
+                        return claim_url
+                except Exception:
+                    pass
+    return None
+
+
 def start_playit():
     """
-    Lance playit.gg via 'script -q' pour lui fournir un vrai PTY,
-    capture l'output brut dans playit-raw.log, strippe les ANSI,
-    puis affiche et sauvegarde dans playit.log.
-    Ensuite relance playit en vrai daemon en arrière-plan.
+    Lance playit avec --data-dir pour forcer l'écriture de ses fichiers
+    de configuration dans un dossier connu.
+    Attend que playit écrive le claim URL dans ses fichiers de config,
+    puis affiche l'URL et relance en daemon.
     """
     print("\n[=] Démarrage de playit.gg...")
 
@@ -649,101 +675,89 @@ def start_playit():
 
     env = os.environ.copy()
     playit_secret = os.environ.get("PLAYIT_SECRET", "")
+
+    os.makedirs(PLAYIT_DIR, exist_ok=True)
+
     if playit_secret:
         env["PLAYIT_SECRET"] = playit_secret
-        print("[=] PLAYIT_SECRET défini, playit va se connecter automatiquement.")
-        # Lance directement en daemon, pas besoin de claim code
-        log_path = os.path.join(HOME_DIR, "playit.log")
+        print("[=] PLAYIT_SECRET défini → lancement daemon direct.")
+        log_path = os.path.join(PLAYIT_DIR, "playit.log")
         with open(log_path, "w") as lf:
-            subprocess.Popen([PLAYIT_BIN], env=env, stdout=lf,
-                             stderr=subprocess.STDOUT, close_fds=True)
-        print("[✓] playit lancé en daemon.")
+            subprocess.Popen(
+                [PLAYIT_BIN, "--data-dir", PLAYIT_DIR],
+                env=env, stdout=lf, stderr=subprocess.STDOUT,
+                close_fds=True,
+            )
+        print("[✓] playit daemon actif.")
         time.sleep(3)
         return
 
-    # Pas de secret : on a besoin de voir le claim code
-    # Utilise 'script -q' pour forcer un PTY et capturer la TUI
-    raw_log  = os.path.join(HOME_DIR, "playit-raw.log")
-    clean_log = os.path.join(HOME_DIR, "playit.log")
+    # Pas de secret : on attend que playit écrive le claim URL dans ses fichiers
+    print("[!] PLAYIT_SECRET non défini.")
+    print(f"[=] Lancement playit --data-dir {PLAYIT_DIR} (20s)...")
 
-    # Vérifie si script est dispo
-    has_script = shutil.which("script") is not None
+    log_path = os.path.join(PLAYIT_DIR, "playit.log")
+    with open(log_path, "w") as lf:
+        proc = subprocess.Popen(
+            [PLAYIT_BIN, "--data-dir", PLAYIT_DIR],
+            env=env,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
 
-    if has_script:
-        print("[=] Capture via 'script -q' (15s)...")
+    # Poll pendant 20s : cherche le claim dans playit.log ET dans les fichiers du data-dir
+    claim_url = None
+    for i in range(20):
+        time.sleep(1)
+        # Cherche dans le log
         try:
-            # script -q -c CMD FILE  -> enregistre dans FILE et quitte quand CMD quitte
-            # On tue playit après 15s pour ne pas bloquer
-            proc = subprocess.Popen(
-                ["script", "-q", "-c", f"{PLAYIT_BIN}", raw_log],
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-            )
-            time.sleep(15)
-            try:
-                proc.send_signal(signal.SIGTERM)
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[!] script -q a échoué : {e}")
-            has_script = False
-
-    if not has_script:
-        # Fallback : lance playit normalement 15s et lit le fichier log
-        print("[=] Fallback : lecture directe de playit (15s)...")
-        with open(raw_log, "wb") as lf:
-            proc = subprocess.Popen(
-                [PLAYIT_BIN], env=env,
-                stdout=lf, stderr=subprocess.STDOUT,
-                close_fds=True,
-            )
-        time.sleep(15)
-        try:
-            proc.send_signal(signal.SIGTERM)
+            with open(log_path, 'r', errors='replace') as f:
+                for line in f:
+                    clean = strip_ansi_bytes(line.encode()).decode('utf-8', errors='replace')
+                    if 'playit.gg/claim' in clean:
+                        claim_url = clean.strip()
+                        break
         except Exception:
             pass
+        if claim_url:
+            break
+        # Cherche dans tous les fichiers du data-dir (toml, json, txt...)
+        claim_url = _search_claim_in_files([PLAYIT_DIR])
+        if claim_url:
+            break
+        if (i + 1) % 5 == 0:
+            print(f"[=] Attente claim... {i+1}s")
 
-    # Lecture et nettoyage
-    try:
-        with open(raw_log, "rb") as f:
-            raw = f.read()
-        clean = strip_ansi_bytes(raw).decode("utf-8", errors="replace")
-        with open(clean_log, "w") as f:
-            f.write(clean)
-        lines = [l for l in clean.splitlines() if l.strip()]
-    except Exception as e:
-        print(f"[!] Erreur lecture log playit : {e}")
-        lines = []
-
-    if lines:
-        print("[=] ===== PLAYIT LOGS =====")
-        for line in lines[:40]:
-            print(f"    {line}")
-        print("[=] ======================")
-        claim_found = False
-        for line in lines:
-            if "playit.gg/claim" in line:
-                print(f"")
-                print(f"[>>>] CLAIM CODE DETECTE :")
-                print(f"[>>>]   {line.strip()}")
-                print(f"[>>>] Ouvrez ce lien pour lier playit à votre compte.")
-                print(f"")
-                claim_found = True
-        if not claim_found:
-            print("[!] Claim code non trouvé dans les logs. Vérifiez playit.log")
+    # Affichage
+    if claim_url:
+        print(f"")
+        print(f"[>>>] ==========================================")
+        print(f"[>>>]  CLAIM CODE PLAYIT :")
+        print(f"[>>>]  {claim_url}")
+        print(f"[>>>]  Ouvrez ce lien pour lier votre compte.")
+        print(f"[>>>] ==========================================")
+        print(f"")
     else:
-        print("[!] playit.log vide. Vérifiez que le binaire fonctionne.")
+        # Dump tout le contenu du data-dir pour debug
+        print("[!] Claim code non trouvé après 20s.")
+        print(f"[=] Contenu de {PLAYIT_DIR} :")
+        for root, dirs, files in os.walk(PLAYIT_DIR):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                print(f"    [fichier] {fpath}")
+                try:
+                    with open(fpath, 'r', errors='replace') as f:
+                        content = f.read(4096)
+                    clean = strip_ansi_bytes(content.encode()).decode('utf-8', errors='replace')
+                    for line in clean.splitlines()[:20]:
+                        if line.strip():
+                            print(f"      {line}")
+                except Exception as e:
+                    print(f"      [erreur lecture: {e}]")
 
-    # Relance en vrai daemon pour que le tunnel reste actif
-    print("[=] Relance de playit en daemon...")
-    with open(clean_log, "a") as lf:
-        subprocess.Popen([PLAYIT_BIN], env=env,
-                         stdout=lf, stderr=subprocess.STDOUT,
-                         close_fds=True)
-    print("[✓] playit daemon actif.")
+    # Laisse playit tourner en daemon (il est déjà en background)
+    print("[✓] playit daemon actif (PID conservé).")
     time.sleep(2)
 
 
