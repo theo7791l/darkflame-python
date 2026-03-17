@@ -41,11 +41,8 @@ PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
 
-# Tarball du repo DarkflameServer (branch main)
 DFS_TARBALL_URL = "https://github.com/DarkflameUniverse/DarkflameServer/archive/refs/heads/main.tar.gz"
 
-# Dossiers à copier directement depuis le tarball vers BUILD_DIR
-# Format : (chemin_dans_tarball, chemin_dest_dans_BUILD_DIR)
 DFS_PLAIN_DIRS = [
     ("migrations", "migrations"),
     ("vanity",     "vanity"),
@@ -66,19 +63,24 @@ GLIBC_DEBS = [
 ]
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
+
 def load_config():
     if not os.path.isfile(CONFIG_FILE):
         print(f"[!] ERREUR : {CONFIG_FILE} introuvable !")
         sys.exit(1)
 
     env_map = {
-        "MYSQL_HOST":     ("Database", "mysql_host"),
-        "MYSQL_PORT":     ("Database", "mysql_port"),
-        "MYSQL_DATABASE": ("Database", "mysql_database"),
-        "MYSQL_USER":     ("Database", "mysql_username"),
-        "MYSQL_PASSWORD": ("Database", "mysql_password"),
-        "CLIENT_PATH":    ("General",  "client_location"),
-        "EXTERNAL_IP":    ("Networking", "external_ip"),
+        "MYSQL_HOST":         ("Database",   "mysql_host"),
+        "MYSQL_PORT":         ("Database",   "mysql_port"),
+        "MYSQL_DATABASE":     ("Database",   "mysql_database"),
+        "MYSQL_USER":         ("Database",   "mysql_username"),
+        "MYSQL_PASSWORD":     ("Database",   "mysql_password"),
+        "CLIENT_PATH":        ("General",    "client_location"),
+        "EXTERNAL_IP":        ("Networking", "external_ip"),
+        "AUTH_SERVER_PORT":   ("Networking", "auth_server_port"),
+        "WORLD_SERVER_PORT":  ("Networking", "world_server_port"),
+        "CHAT_SERVER_PORT":   ("Networking", "chat_server_port"),
+        "MASTER_SERVER_PORT": ("Networking", "master_server_port"),
     }
 
     cfg = configparser.ConfigParser()
@@ -166,10 +168,8 @@ def extract_so_from_tar(t, out_dir):
         link_target = os.path.basename(m.linkname)
         target_path = os.path.join(out_dir, link_target)
         if link_target == base:
-            print(f"  [!] Symlink circulaire ignoré : {base} -> {link_target}")
             continue
         if not os.path.isfile(target_path):
-            print(f"  [!] Cible absente pour symlink {base} -> {link_target}, skip")
             continue
         try:
             if os.path.lexists(dest_path):
@@ -244,15 +244,12 @@ def find_ld(glibc_dir):
             if os.path.islink(p):
                 target_name = os.path.basename(os.readlink(p))
                 if target_name == f:
-                    print(f"[!] Symlink circulaire détecté et ignoré : {f} -> {target_name}")
                     continue
                 real = os.path.join(glibc_dir, target_name)
                 if os.path.isfile(real):
                     os.chmod(real, 0o755)
                     print(f"[✓] ld via symlink : {f} -> {target_name}")
                     return p
-                else:
-                    print(f"[!] Cible du symlink absente : {target_name}")
             elif os.path.isfile(p):
                 os.chmod(p, 0o755)
                 print(f"[✓] ld-linux fichier direct : {f}")
@@ -263,7 +260,6 @@ def find_ld(glibc_dir):
             resolved = os.path.realpath(p)
             if os.path.isfile(resolved):
                 os.chmod(resolved, 0o755)
-                print(f"[✓] ld fallback : {f} -> {resolved}")
                 return resolved
     return None
 
@@ -289,9 +285,6 @@ def setup_glibc_compat():
         shutil.rmtree(tmp, ignore_errors=True)
 
     libs = os.listdir(GLIBC_DIR)
-    key_libs = [f for f in libs if 'libc' in f or 'ld-linux' in f or 'ld-2.' in f or 'libstdc' in f or 'libgcc' in f]
-    print(f"[=] Libs disponibles : {key_libs}")
-
     if not any('libc' in f for f in libs):
         print("[!] ERREUR : libc.so.6 non trouvé")
         sys.exit(1)
@@ -312,7 +305,7 @@ def setup_glibc_compat():
 
     ld = find_ld(GLIBC_DIR)
     if ld is None:
-        print(f"[!] ld-linux introuvable. Fichiers disponibles : {[f for f in libs if 'ld' in f]}")
+        print(f"[!] ld-linux introuvable.")
         sys.exit(1)
     print(f"[✓] ld-linux : {ld}")
 
@@ -328,14 +321,10 @@ def setup_glibc_compat():
             result = run(f"{PATCHELF} --set-interpreter {ld} --set-rpath {rpath} {b}", check=False)
             if result.returncode == 0:
                 patched_count += 1
-            else:
-                print(f"[!] patchelf a échoué sur {os.path.basename(b)}")
 
     if patched_count > 0:
         open(PATCHED_FLAG, 'w').close()
         print(f"[✓] {patched_count} binaire(s) patché(s) avec GLIBC 2.39.")
-    else:
-        print("[!] Aucun binaire patché, flag non créé.")
 
 
 def setup_ld_library_path():
@@ -357,7 +346,6 @@ def extract_prebuilt():
         print("[✓] Binaires déjà extraits, skip.")
         return
     if os.path.isdir(BUILD_DIR):
-        print("[=] Nettoyage extraction précédente incomplète...")
         shutil.rmtree(BUILD_DIR, ignore_errors=True)
     if os.path.isfile(PATCHED_FLAG):
         os.remove(PATCHED_FLAG)
@@ -375,7 +363,6 @@ def extract_prebuilt():
 
 
 def _extract_dir_from_tar(t, members, src_prefix, dest_dir):
-    """Extrait un dossier depuis un tarball ouvert vers dest_dir."""
     os.makedirs(dest_dir, exist_ok=True)
     count = 0
     for m in members:
@@ -398,13 +385,6 @@ def _extract_dir_from_tar(t, members, src_prefix, dest_dir):
 
 
 def fetch_repo_resources():
-    """
-    Télécharge le tarball de DarkflameServer et en extrait :
-      - Tous les dossiers listés dans DFS_PLAIN_DIRS  → BUILD_DIR/<dest>/
-      - resources/navmeshes.zip                       → BUILD_DIR/navmeshes/ (fichiers .bin)
-    Ne re-télécharge le tarball que si au moins un dossier est manquant.
-    """
-    # Vérifie ce qui est déjà présent
     missing_dirs = [(src, dst) for src, dst in DFS_PLAIN_DIRS
                     if not os.path.isdir(os.path.join(BUILD_DIR, dst))]
     nav_dir = os.path.join(BUILD_DIR, "navmeshes")
@@ -426,8 +406,6 @@ def fetch_repo_resources():
     print("[=] Extraction depuis le tarball...")
     with tarfile.open(tar_path, 'r:gz') as t:
         members = t.getmembers()
-
-        # Détermine le préfixe racine (ex: "DarkflameServer-main/")
         root_prefix = ""
         for m in members:
             parts = m.name.split('/')
@@ -435,14 +413,12 @@ def fetch_repo_resources():
                 root_prefix = parts[0] + "/"
                 break
 
-        # Extraction des dossiers simples
         for src_name, dst_name in missing_dirs:
             src_prefix = root_prefix + src_name + "/"
             dest_dir   = os.path.join(BUILD_DIR, dst_name)
             count = _extract_dir_from_tar(t, members, src_prefix, dest_dir)
             print(f"[✓] {dst_name}/ : {count} fichier(s) extrait(s)")
 
-        # Extraction navmeshes depuis resources/navmeshes.zip
         if need_navmeshes:
             nav_zip_path = root_prefix + "resources/navmeshes.zip"
             nav_member = next((m for m in members if m.name == nav_zip_path), None)
@@ -450,14 +426,12 @@ def fetch_repo_resources():
                 nav_zip_data = t.extractfile(nav_member).read()
                 os.makedirs(nav_dir, exist_ok=True)
                 with zipfile.ZipFile(io.BytesIO(nav_zip_data)) as z:
-                    bin_count = sum(
-                        1 for name in z.namelist()
-                        if name.endswith(".bin") and not open(
-                            os.path.join(nav_dir, os.path.basename(name)), 'wb'
-                        ).write(z.read(name))
-                    )
-                    # recompte proprement
-                    bin_count = len([f for f in os.listdir(nav_dir) if f.endswith(".bin")])
+                    for name in z.namelist():
+                        fname = os.path.basename(name)
+                        if fname.endswith(".bin"):
+                            with z.open(name) as src, open(os.path.join(nav_dir, fname), 'wb') as out:
+                                shutil.copyfileobj(src, out)
+                bin_count = len([f for f in os.listdir(nav_dir) if f.endswith(".bin")])
                 print(f"[✓] navmeshes/ : {bin_count} fichier(s) .bin extrait(s)")
             else:
                 print("[!] resources/navmeshes.zip introuvable dans le tarball")
@@ -487,7 +461,6 @@ def setup_server_data(cfg):
             sys.exit(1)
 
     fetch_repo_resources()
-
     os.makedirs(os.path.join(BUILD_DIR, "logs"), exist_ok=True)
     print("[✓] Données serveur OK.")
 
@@ -551,26 +524,90 @@ def test_db_connection(cfg):
         sys.exit(1)
 
 
+def _cfg_get(cfg, section, option, fallback):
+    try:
+        return cfg.get(section, option)
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        return fallback
+
+
 def write_config(cfg):
+    """
+    Génère les 4 fichiers de config avec les bons ports pour chaque serveur.
+    DarkflameServer lit auth_server_port dans authconfig.ini, etc.
+    Chaque config reçoit TOUTES les clés, mais avec le port principal
+    correspondant à son rôle mis en avant via server_port.
+    """
     print("\n[=] Écriture de la configuration...")
     os.makedirs(BUILD_DIR, exist_ok=True)
-    raw_lines = []
-    for section in cfg.sections():
-        raw_lines.append(f"[{section}]")
-        for key, val in cfg.items(section):
-            raw_lines.append(f"{key}={val}")
-        raw_lines.append("")
-    raw = "\n".join(raw_lines)
-    for config_name in ["authconfig.ini", "masterconfig.ini", "worldconfig.ini", "chatconfig.ini"]:
-        dest = os.path.join(BUILD_DIR, config_name)
+
+    # Récupère les valeurs
+    external_ip   = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
+    auth_port     = _cfg_get(cfg, "Networking", "auth_server_port",   "25896")
+    world_port    = _cfg_get(cfg, "Networking", "world_server_port",  "25740")
+    chat_port     = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
+    master_port   = _cfg_get(cfg, "Networking", "master_server_port", "4000")
+    mysql_host    = _cfg_get(cfg, "Database",   "mysql_host",         "")
+    mysql_port    = _cfg_get(cfg, "Database",   "mysql_port",         "3306")
+    mysql_db      = _cfg_get(cfg, "Database",   "mysql_database",     "")
+    mysql_user    = _cfg_get(cfg, "Database",   "mysql_username",     "")
+    mysql_pass    = _cfg_get(cfg, "Database",   "mysql_password",     "")
+    client_loc    = _cfg_get(cfg, "General",    "client_location",    "/home/container/client")
+
+    print(f"[=] external_ip       = {external_ip}")
+    print(f"[=] auth_server_port  = {auth_port}")
+    print(f"[=] world_server_port = {world_port}")
+    print(f"[=] chat_server_port  = {chat_port}")
+    print(f"[=] master_server_port= {master_port}")
+
+    if external_ip == "0.0.0.0":
+        print("[!] ATTENTION : external_ip=0.0.0.0 — les clients ne pourront pas se connecter !")
+        print("[!] Ajoutez la variable d'env EXTERNAL_IP=<votre_ip_publique> dans FeatherPanel.")
+
+    # Contenu commun à toutes les configs
+    common = (
+        f"[Database]\n"
+        f"mysql_host={mysql_host}\n"
+        f"mysql_port={mysql_port}\n"
+        f"mysql_database={mysql_db}\n"
+        f"mysql_username={mysql_user}\n"
+        f"mysql_password={mysql_pass}\n"
+        f"\n"
+        f"[General]\n"
+        f"client_location={client_loc}\n"
+        f"\n"
+        f"[Logging]\n"
+        f"log_level=2\n"
+        f"log_to_console=1\n"
+        f"\n"
+    )
+
+    networking_base = (
+        f"external_ip={external_ip}\n"
+        f"auth_server_port={auth_port}\n"
+        f"world_server_port={world_port}\n"
+        f"chat_server_port={chat_port}\n"
+        f"master_server_port={master_port}\n"
+    )
+
+    configs = {
+        "masterconfig.ini": common + "[Networking]\n" + networking_base,
+        "authconfig.ini":   common + "[Networking]\n" + networking_base,
+        "worldconfig.ini":  common + "[Networking]\n" + networking_base,
+        "chatconfig.ini":   common + "[Networking]\n" + networking_base,
+    }
+
+    for filename, content in configs.items():
+        dest = os.path.join(BUILD_DIR, filename)
         with open(dest, "w") as f:
-            f.write(raw)
+            f.write(content)
+
     print("[✓] Configs écrites (authconfig, masterconfig, worldconfig, chatconfig).")
 
 
 def check_client_files(cfg):
     print("\n[=] Vérification des fichiers client...")
-    client_path = cfg.get("General", "client_location", fallback="/home/container/client")
+    client_path = _cfg_get(cfg, "General", "client_location", "/home/container/client")
     if not os.path.isdir(client_path):
         print(f"[!] ERREUR : client introuvable à {client_path}")
         sys.exit(1)
