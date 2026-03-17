@@ -31,14 +31,15 @@ except ImportError:
     pip_install("zstandard")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-HOME_DIR    = "/home/container"
-BINS_ZIP    = os.path.join(HOME_DIR, "darkflame-bins.zip")
-BUILD_DIR   = os.path.join(HOME_DIR, "darkflame-build")
-SERVER_DIR  = os.path.join(HOME_DIR, "DarkflameServer")
-CONFIG_FILE = os.path.join(HOME_DIR, "config_template.ini")
-GLIBC_DIR   = os.path.join(HOME_DIR, "glibc-compat")
-PATCHELF    = os.path.join(HOME_DIR, "patchelf")
+HOME_DIR     = "/home/container"
+BINS_ZIP     = os.path.join(HOME_DIR, "darkflame-bins.zip")
+BUILD_DIR    = os.path.join(HOME_DIR, "darkflame-build")
+SERVER_DIR   = os.path.join(HOME_DIR, "DarkflameServer")
+CONFIG_FILE  = os.path.join(HOME_DIR, "config_template.ini")
+GLIBC_DIR    = os.path.join(HOME_DIR, "glibc-compat")
+PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
+EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
 
 BINARY_NAMES = {
     "master": ["MasterServer", "masterserver"],
@@ -56,34 +57,76 @@ GLIBC_DEBS = [
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
 def load_config():
+    """
+    Charge la config depuis config_template.ini en injectant les variables
+    d'environnement Pterodactyl si disponibles.
+    """
     if not os.path.isfile(CONFIG_FILE):
         print(f"[!] ERREUR : {CONFIG_FILE} introuvable !")
         sys.exit(1)
+
+    raw = open(CONFIG_FILE).read()
+
+    # Injection des variables d'environnement Pterodactyl
+    env_map = {
+        "MYSQL_HOST":     ("Database", "mysql_host"),
+        "MYSQL_PORT":     ("Database", "mysql_port"),
+        "MYSQL_DATABASE": ("Database", "mysql_database"),
+        "MYSQL_USER":     ("Database", "mysql_username"),
+        "MYSQL_PASSWORD": ("Database", "mysql_password"),
+        "CLIENT_PATH":    ("General",  "client_location"),
+        "EXTERNAL_IP":    ("Networking", "external_ip"),
+    }
+
     cfg = configparser.ConfigParser()
     cfg.read(CONFIG_FILE)
+
+    for env_key, (section, option) in env_map.items():
+        val = os.environ.get(env_key)
+        if val:
+            if not cfg.has_section(section):
+                cfg.add_section(section)
+            cfg.set(section, option, val)
+            print(f"[=] Env override: {section}.{option} = {val}")
+
     return cfg
 
+
 def find_binary(name_key):
+    """Cherche un binaire dans BUILD_DIR et ses sous-dossiers immédiats (bug #10 fix)."""
+    search_dirs = [BUILD_DIR]
+    if os.path.isdir(BUILD_DIR):
+        for entry in os.listdir(BUILD_DIR):
+            sub = os.path.join(BUILD_DIR, entry)
+            if os.path.isdir(sub):
+                search_dirs.append(sub)
+
     for name in BINARY_NAMES[name_key]:
-        path = os.path.join(BUILD_DIR, name)
-        if os.path.isfile(path):
-            return path
+        for d in search_dirs:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                return path
     return None
+
 
 def run(cmd, cwd=None, check=True):
     print(f"[+] {cmd}")
     return subprocess.run(cmd, shell=True, cwd=cwd, check=check)
 
-def has_sudo():
-    return subprocess.run("sudo -n true", shell=True, capture_output=True).returncode == 0
 
 def needs_glibc_compat():
+    """Retourne True si les binaires nécessitent une GLIBC plus récente (bug #4 fix)."""
     master = find_binary("master")
     if master is None:
         return False
     r = subprocess.run(["ldd", master], capture_output=True, text=True)
+    if r.returncode != 0:
+        # ldd a échoué → probablement GLIBC incompatible, on active le compat
+        print("[!] ldd a échoué → activation GLIBC compat par précaution")
+        return True
     output = r.stdout + r.stderr
     return "GLIBC_2.38" in output or "GLIBC_2.39" in output or "not found" in output
+
 
 def download_file(url, dest):
     print(f"[=] Téléchargement {url.split('/')[-1]}...")
@@ -91,13 +134,11 @@ def download_file(url, dest):
     with urllib.request.urlopen(req, timeout=60) as r, open(dest, 'wb') as f:
         shutil.copyfileobj(r, f)
 
+
 def extract_so_from_tar(t, out_dir):
     """
-    Extrait depuis un tarfile :
-    - tous les fichiers réguliers dont le nom contient ".so" OU qui sont le fichier réel d'un ld-linux
-    - recrée les symlinks .so
-    Le fichier réel derrière ld-linux-x86-64.so.2 s'appelle ld-2.39.so (pas de .so dans le basename)
-    donc on extrait TOUS les fichiers dans lib/x86_64-linux-gnu/
+    Extrait depuis un tarfile tous les .so et ld-linux.
+    Fix bug #2 : vérifie que la cible d'un symlink existe avant de le créer.
     """
     members = t.getmembers()
 
@@ -106,10 +147,10 @@ def extract_so_from_tar(t, out_dir):
         base = os.path.basename(m.name)
         if not base:
             continue
-        # Inclure les .so ET les ld-*.so (ex: ld-2.39.so sans point dans le milieu)
-        is_so = ".so" in base
-        is_ld_real = base.startswith("ld-") and base.endswith(".so")
-        if not (is_so or is_ld_real):
+        is_so   = ".so" in base
+        is_ld   = base.startswith("ld-") and ".so" in base
+        is_ld_real = base.startswith("ld-") and base.endswith(".so")  # ex: ld-2.39.so
+        if not (is_so or is_ld or is_ld_real):
             continue
         if not m.isfile():
             continue
@@ -123,22 +164,32 @@ def extract_so_from_tar(t, out_dir):
         except Exception as e:
             print(f"  [!] Erreur extraction {base}: {e}")
 
-    # Pass 2 : symlinks
+    # Pass 2 : symlinks — uniquement si la cible existe (bug #2 fix)
     for m in members:
         base = os.path.basename(m.name)
         if not base or not m.issym():
             continue
         if ".so" not in base and not base.startswith("ld-"):
             continue
-        dest_path = os.path.join(out_dir, base)
+        dest_path  = os.path.join(out_dir, base)
+        link_target = os.path.basename(m.linkname)
+        target_path = os.path.join(out_dir, link_target)
+
+        # Ignorer les symlinks circulaires ou dont la cible est absente
+        if link_target == base:
+            print(f"  [!] Symlink circulaire ignoré : {base} -> {link_target}")
+            continue
+        if not os.path.isfile(target_path):
+            print(f"  [!] Cible absente pour symlink {base} -> {link_target}, skip")
+            continue
+
         try:
             if os.path.lexists(dest_path):
                 os.remove(dest_path)
-            # Stocker uniquement le basename de la cible (on est dans un seul dossier plat)
-            link_target = os.path.basename(m.linkname)
             os.symlink(link_target, dest_path)
         except Exception as e:
             print(f"  [!] Erreur symlink {base}: {e}")
+
 
 def extract_tar_zst(zst_path, out_dir):
     dctx = zstd.ZstdDecompressor()
@@ -146,6 +197,7 @@ def extract_tar_zst(zst_path, out_dir):
         tar_bytes = dctx.stream_reader(f).read()
     with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as t:
         extract_so_from_tar(t, out_dir)
+
 
 def _extract_deb_ar(deb_path, work_dir):
     with open(deb_path, 'rb') as f:
@@ -166,6 +218,7 @@ def _extract_deb_ar(deb_path, work_dir):
                     g.write(data)
                 return out
     return None
+
 
 def extract_deb_libs(deb_path, out_dir):
     work = deb_path + ".work"
@@ -188,38 +241,60 @@ def extract_deb_libs(deb_path, out_dir):
             extract_so_from_tar(t, out_dir)
     shutil.rmtree(work, ignore_errors=True)
 
+
 def find_ld(glibc_dir):
-    """Retourne le chemin absolu vers ld-linux-x86-64.so.2 (symlink ou fichier réel)."""
-    # Chercher le symlink ld-linux-x86-64.so.2
+    """
+    Retourne le chemin absolu vers ld-linux-x86-64.so.2 ou ld-2.*.so.
+    Fix bug #1 : priorité au fichier réel ld-2.*.so, détection symlinks circulaires.
+    """
+    # Priorité 1 : fichier réel ld-2.*.so (ex: ld-2.39.so)
+    for f in os.listdir(glibc_dir):
+        if f.startswith("ld-2.") and f.endswith(".so"):
+            p = os.path.join(glibc_dir, f)
+            if os.path.isfile(p) and not os.path.islink(p):
+                os.chmod(p, 0o755)
+                print(f"[✓] ld réel trouvé : {f}")
+                return p
+
+    # Priorité 2 : symlink ld-linux-x86-64.so.2 pointant vers un fichier réel
     for f in os.listdir(glibc_dir):
         if "ld-linux" in f:
             p = os.path.join(glibc_dir, f)
             if os.path.islink(p):
                 target_name = os.path.basename(os.readlink(p))
+                if target_name == f:
+                    print(f"[!] Symlink circulaire détecté et ignoré : {f} -> {target_name}")
+                    continue
                 real = os.path.join(glibc_dir, target_name)
                 if os.path.isfile(real):
                     os.chmod(real, 0o755)
+                    print(f"[✓] ld via symlink : {f} -> {target_name}")
                     return p
                 else:
-                    print(f"[!] Symlink {f} -> {target_name} introuvable")
+                    print(f"[!] Cible du symlink absente : {target_name}")
             elif os.path.isfile(p):
                 os.chmod(p, 0o755)
+                print(f"[✓] ld-linux fichier direct : {f}")
                 return p
-    # Fallback : chercher ld-2.*.so directement
+
+    # Priorité 3 : tout fichier commençant par ld-
     for f in os.listdir(glibc_dir):
-        if f.startswith("ld-2.") and f.endswith(".so"):
+        if f.startswith("ld-"):
             p = os.path.join(glibc_dir, f)
-            os.chmod(p, 0o755)
-            return p
+            resolved = os.path.realpath(p)  # résout les symlinks
+            if os.path.isfile(resolved):
+                os.chmod(resolved, 0o755)
+                print(f"[✓] ld fallback : {f} -> {resolved}")
+                return resolved
+
     return None
 
+
 def setup_glibc_compat():
-    # Skipped uniquement si déjà patché avec succès
     if os.path.isfile(PATCHED_FLAG):
         print("[✓] GLIBC compat déjà appliqué, skip.")
         return
 
-    # Télécharger les libs si pas encore fait
     if not os.path.isdir(GLIBC_DIR) or not any('libc' in f for f in os.listdir(GLIBC_DIR)):
         print("[=] GLIBC_2.38 requis → téléchargement libs Ubuntu 24.04...")
         shutil.rmtree(GLIBC_DIR, ignore_errors=True)
@@ -243,7 +318,6 @@ def setup_glibc_compat():
         print("[!] ERREUR : libc.so.6 non trouvé")
         sys.exit(1)
 
-    # patchelf
     if not os.path.isfile(PATCHELF):
         print("[=] Téléchargement patchelf...")
         tar = os.path.join(HOME_DIR, "patchelf.tar.gz")
@@ -260,7 +334,7 @@ def setup_glibc_compat():
 
     ld = find_ld(GLIBC_DIR)
     if ld is None:
-        print(f"[!] ld-linux introuvable. Fichiers : {[f for f in libs if 'ld' in f]}")
+        print(f"[!] ld-linux introuvable. Fichiers disponibles : {[f for f in libs if 'ld' in f]}")
         sys.exit(1)
     print(f"[✓] ld-linux : {ld}")
 
@@ -268,15 +342,24 @@ def setup_glibc_compat():
                                "src", "mariadb_connector_cpp-build")
     rpath = f"{GLIBC_DIR}:{BUILD_DIR}:{mariadb_lib}"
 
+    # Bug #7 fix : patcher tous les binaires, créer le flag UNIQUEMENT si tout réussit
+    patched_count = 0
     for key in BINARY_NAMES:
         b = find_binary(key)
         if b:
             print(f"[=] Patch {os.path.basename(b)} → GLIBC compat...")
-            run(f"{PATCHELF} --set-interpreter {ld} --set-rpath {rpath} {b}")
+            result = run(f"{PATCHELF} --set-interpreter {ld} --set-rpath {rpath} {b}", check=False)
+            if result.returncode == 0:
+                patched_count += 1
+            else:
+                print(f"[!] patchelf a échoué sur {os.path.basename(b)}")
 
-    # Marquer comme patché
-    open(PATCHED_FLAG, 'w').close()
-    print("[✓] Binaires patchés avec GLIBC 2.39.")
+    if patched_count > 0:
+        open(PATCHED_FLAG, 'w').close()
+        print(f"[✓] {patched_count} binaire(s) patché(s) avec GLIBC 2.39.")
+    else:
+        print("[!] Aucun binaire patché, flag non créé.")
+
 
 def setup_ld_library_path():
     paths = [BUILD_DIR, GLIBC_DIR]
@@ -290,11 +373,19 @@ def setup_ld_library_path():
     os.environ["LD_LIBRARY_PATH"] = new_path
     print(f"[=] LD_LIBRARY_PATH={new_path}")
 
+
 def extract_prebuilt():
     print("\n[=] darkflame-bins.zip détecté → mode binaires pré-compilés")
-    if find_binary("master") is not None:
+    # Bug #6 fix : utiliser un flag pour détecter extraction complète
+    if os.path.isfile(EXTRACT_FLAG) and find_binary("master") is not None:
         print("[✓] Binaires déjà extraits, skip.")
         return
+    # Nettoyer en cas d'extraction partielle
+    if os.path.isdir(BUILD_DIR):
+        print("[=] Nettoyage extraction précédente incomplète...")
+        shutil.rmtree(BUILD_DIR, ignore_errors=True)
+    if os.path.isfile(PATCHED_FLAG):
+        os.remove(PATCHED_FLAG)
     print("[=] Extraction des binaires...")
     os.makedirs(BUILD_DIR, exist_ok=True)
     with zipfile.ZipFile(BINS_ZIP, 'r') as z:
@@ -304,30 +395,34 @@ def extract_prebuilt():
             p = os.path.join(BUILD_DIR, name)
             if os.path.isfile(p):
                 os.chmod(p, 0o755)
+    open(EXTRACT_FLAG, 'w').close()
     print("[✓] Binaires extraits dans", BUILD_DIR)
+
 
 def install_runtime_deps():
     print("\n[=] Vérification des dépendances runtime...")
-    apt = "sudo apt-get" if has_sudo() else "apt-get"
-    r = subprocess.run(f"{apt} update -qq", shell=True)
+    # Bug #8 fix : pas de sudo dans un container Pterodactyl
+    r = subprocess.run("apt-get update -qq", shell=True, capture_output=True)
     if r.returncode != 0:
         print("[!] apt-get indisponible, on continue.")
         return
-    subprocess.run(f"{apt} install -y libmariadb3 libssl3 unzip binutils", shell=True)
+    subprocess.run("apt-get install -y libmariadb3 libssl3 unzip binutils", shell=True)
+
 
 def install_build_deps():
-    apt = "sudo apt-get" if has_sudo() else "apt-get"
-    r = subprocess.run(f"{apt} update -qq", shell=True)
+    r = subprocess.run("apt-get update -qq", shell=True, capture_output=True)
     if r.returncode != 0:
-        print("[!] ERREUR : pas de droits sudo. Uploadez darkflame-bins.zip.")
+        print("[!] ERREUR : apt-get non disponible. Uploadez darkflame-bins.zip.")
         sys.exit(1)
-    run(f"{apt} install -y git cmake g++ zlib1g-dev libssl-dev libmariadb-dev-compat libmariadb-dev unzip")
+    run("apt-get install -y git cmake g++ zlib1g-dev libssl-dev libmariadb-dev-compat libmariadb-dev unzip")
+
 
 def clone_server():
     if os.path.exists(SERVER_DIR):
         run("git pull", cwd=SERVER_DIR)
     else:
         run(f"git clone --recursive https://github.com/DarkflameUniverse/DarkflameServer.git {SERVER_DIR}")
+
 
 def build_server():
     if find_binary("master") is not None:
@@ -343,6 +438,7 @@ def build_server():
             if os.path.isdir(p): shutil.rmtree(p, ignore_errors=True)
             elif item.endswith((".o", ".a", ".cmake")): os.remove(p)
     shutil.rmtree(SERVER_DIR, ignore_errors=True)
+
 
 def test_db_connection(cfg):
     print("\n[=] Test de connexion à la base de données...")
@@ -362,15 +458,30 @@ def test_db_connection(cfg):
         print(f"[!] ERREUR connexion DB : {e}")
         sys.exit(1)
 
-def write_config():
+
+def write_config(cfg):
+    """
+    Écrit les 4 fichiers de config DarkflameServer depuis la config chargée.
+    Bug #3 fix : chaque config est écrite depuis cfg, pas copiée depuis authconfig.
+    """
     print("\n[=] Écriture de la configuration...")
-    raw = open(CONFIG_FILE).read()
-    base_cfg = os.path.join(BUILD_DIR, "authconfig.ini")
-    with open(base_cfg, "w") as f:
-        f.write(raw)
-    for c in ["masterconfig.ini", "worldconfig.ini", "chatconfig.ini"]:
-        shutil.copy(base_cfg, os.path.join(BUILD_DIR, c))
-    print("[✓] Configs écrites.")
+    os.makedirs(BUILD_DIR, exist_ok=True)
+
+    # Reconstruire le contenu INI depuis cfg
+    raw_lines = []
+    for section in cfg.sections():
+        raw_lines.append(f"[{section}]")
+        for key, val in cfg.items(section):
+            raw_lines.append(f"{key}={val}")
+        raw_lines.append("")
+    raw = "\n".join(raw_lines)
+
+    for config_name in ["authconfig.ini", "masterconfig.ini", "worldconfig.ini", "chatconfig.ini"]:
+        dest = os.path.join(BUILD_DIR, config_name)
+        with open(dest, "w") as f:
+            f.write(raw)
+    print("[✓] Configs écrites (authconfig, masterconfig, worldconfig, chatconfig).")
+
 
 def check_client_files(cfg):
     print("\n[=] Vérification des fichiers client...")
@@ -385,18 +496,30 @@ def check_client_files(cfg):
         sys.exit(1)
     print(f"[✓] Fichiers client OK à {client_path}")
 
-def start_server():
+
+def start_server(cfg):
+    """
+    Bug #5 fix : setup GLIBC compat et LD_LIBRARY_PATH de façon plus robuste.
+    On applique toujours le LD_LIBRARY_PATH si glibc-compat existe.
+    """
     print("\n[=] Démarrage de Darkflame Universe...")
     master = find_binary("master")
     if master is None:
         print(f"[!] ERREUR : MasterServer introuvable dans {BUILD_DIR}")
         sys.exit(1)
+
+    # Appliquer GLIBC compat si nécessaire
     if needs_glibc_compat():
         setup_glibc_compat()
-    setup_ld_library_path()
+
+    # Toujours configurer LD_LIBRARY_PATH si glibc-compat existe
+    if os.path.isdir(GLIBC_DIR):
+        setup_ld_library_path()
+
     print(f"[✓] Lancement de {master}")
     os.chdir(BUILD_DIR)
     os.execve(master, [master], os.environ)
+
 
 def main():
     print("===================================================")
@@ -413,8 +536,9 @@ def main():
         build_server()
     check_client_files(cfg)
     test_db_connection(cfg)
-    write_config()
-    start_server()
+    write_config(cfg)
+    start_server(cfg)
+
 
 if __name__ == "__main__":
     main()
