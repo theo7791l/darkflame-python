@@ -74,6 +74,18 @@ GLIBC_DEBS = [
 ]
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
+# Ports ouverts sur le container :
+#   25896 -> Auth
+#   25846 -> Master
+#   25784 -> Chat
+#   25740 -> World zone 1000 instance 1  (start + 1*3 = 25737+3)
+# world_port_start = 25740 - 3 = 25737
+DEFAULT_AUTH_PORT    = "25896"
+DEFAULT_MASTER_PORT  = "25846"
+DEFAULT_CHAT_PORT    = "25784"
+DEFAULT_WORLD_PORT   = "25740"
+DEFAULT_WPS          = "25737"
+
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -744,18 +756,13 @@ def write_config(cfg):
     fdb_path       = _cfg_get(cfg, "General", "fdb_path",        "")
 
     external_ip  = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
-    auth_port    = _cfg_get(cfg, "Networking", "auth_server_port",   "25896")
-    world_port   = _cfg_get(cfg, "Networking", "world_server_port",  "25740")
-    chat_port    = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
-    master_port  = _cfg_get(cfg, "Networking", "master_server_port", "25846")
+    auth_port    = _cfg_get(cfg, "Networking", "auth_server_port",   DEFAULT_AUTH_PORT)
+    world_port   = _cfg_get(cfg, "Networking", "world_server_port",  DEFAULT_WORLD_PORT)
+    chat_port    = _cfg_get(cfg, "Networking", "chat_server_port",   DEFAULT_CHAT_PORT)
+    master_port  = _cfg_get(cfg, "Networking", "master_server_port", DEFAULT_MASTER_PORT)
 
-    # DarkflameServer calcule le port des zones ainsi :
-    # port = world_port_start + (instance_id * 3)
-    # Zone 0  instance 0 : start + 0 = start         (interne, pas besoin d'etre ouvert)
-    # Zone 1000 instance 1 : start + 3 = start+3     (port public, doit etre 25740)
-    # => world_port_start = 25740 - 3 = 25737
     env_wps = os.environ.get("WORLD_PORT_START", "").strip()
-    world_port_start = env_wps if env_wps else "25737"
+    world_port_start = env_wps if env_wps else DEFAULT_WPS
 
     max_offline_time       = _cfg_get(cfg, "Gameplay", "max_offline_time",       "0")
     kick_after_failed_auth = _cfg_get(cfg, "Gameplay", "kick_after_failed_auth", "1")
@@ -771,12 +778,13 @@ def write_config(cfg):
     wps_int = int(world_port_start)
     print(f"[=] external_ip        = {external_ip}")
     print(f"[=] auth_server_port   = {auth_port}")
-    print(f"[=] world_server_port  = {world_port}")
+    print(f"[=] master_server_port = {master_port}")
+    print(f"[=] chat_server_port   = {chat_port}")
     print(f"[=] world_port_start   = {world_port_start}")
     print(f"[=]   zone 0  inst 0   = {wps_int + 0*3} (interne)")
-    print(f"[=]   zone 1000 inst 1 = {wps_int + 1*3} (doit etre 25740)")
-    print(f"[=] chat_server_port   = {chat_port}")
-    print(f"[=] master_server_port = {master_port}")
+    print(f"[=]   zone 1000 inst 1 = {wps_int + 1*3} (port ouvert = 25740 ?)")
+    if wps_int + 3 != 25740:
+        print(f"[!] ATTENTION : zone 1000 utilisera le port {wps_int+3}, pas 25740 !")
 
     if external_ip == "0.0.0.0":
         print("[!] ATTENTION : external_ip=0.0.0.0 — ajoutez EXTERNAL_IP dans Pterodactyl.")
