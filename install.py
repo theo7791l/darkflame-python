@@ -749,10 +749,13 @@ def write_config(cfg):
     chat_port    = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
     master_port  = _cfg_get(cfg, "Networking", "master_server_port", "25846")
 
-    # world_port_start : DFS fait port = start + instance_id
-    # Zone 1000 instance 1 = start + 1 = 25740 => start = 25739
+    # DarkflameServer calcule le port des zones ainsi :
+    # port = world_port_start + (instance_id * 3)
+    # Zone 0  instance 0 : start + 0 = start         (interne, pas besoin d'etre ouvert)
+    # Zone 1000 instance 1 : start + 3 = start+3     (port public, doit etre 25740)
+    # => world_port_start = 25740 - 3 = 25737
     env_wps = os.environ.get("WORLD_PORT_START", "").strip()
-    world_port_start = env_wps if env_wps else "25739"
+    world_port_start = env_wps if env_wps else "25737"
 
     max_offline_time       = _cfg_get(cfg, "Gameplay", "max_offline_time",       "0")
     kick_after_failed_auth = _cfg_get(cfg, "Gameplay", "kick_after_failed_auth", "1")
@@ -765,10 +768,13 @@ def write_config(cfg):
     log_to_console = _cfg_get(cfg, "Logging", "log_to_console", "1")
     log_to_file    = _cfg_get(cfg, "Logging", "log_to_file",    "0")
 
+    wps_int = int(world_port_start)
     print(f"[=] external_ip        = {external_ip}")
     print(f"[=] auth_server_port   = {auth_port}")
     print(f"[=] world_server_port  = {world_port}")
-    print(f"[=] world_port_start   = {world_port_start} (zone 1000 instance 1 = {int(world_port_start)+1})")
+    print(f"[=] world_port_start   = {world_port_start}")
+    print(f"[=]   zone 0  inst 0   = {wps_int + 0*3} (interne)")
+    print(f"[=]   zone 1000 inst 1 = {wps_int + 1*3} (doit etre 25740)")
     print(f"[=] chat_server_port   = {chat_port}")
     print(f"[=] master_server_port = {master_port}")
 
