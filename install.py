@@ -37,6 +37,7 @@ BINS_ZIP     = os.path.join(HOME_DIR, "darkflame-bins.zip")
 BUILD_DIR    = os.path.join(HOME_DIR, "darkflame-build")
 SERVER_DIR   = os.path.join(HOME_DIR, "DarkflameServer")
 CONFIG_FILE  = os.path.join(HOME_DIR, "config_template.ini")
+REPO_DIR     = os.path.join(HOME_DIR, "darkflame-python")
 GLIBC_DIR    = os.path.join(HOME_DIR, "glibc-compat")
 PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
@@ -65,43 +66,52 @@ GLIBC_DEBS = [
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
 
-def load_config():
-    if not os.path.isfile(CONFIG_FILE):
-        print(f"[!] ERREUR : {CONFIG_FILE} introuvable !")
+def refresh_config_template():
+    """Toujours écraser config_template.ini depuis le repo cloné pour éviter les sections périmées."""
+    repo_cfg = os.path.join(REPO_DIR, "config_template.ini")
+    if os.path.isfile(repo_cfg):
+        shutil.copy2(repo_cfg, CONFIG_FILE)
+        print(f"[✓] config_template.ini mis à jour depuis le repo.")
+    elif not os.path.isfile(CONFIG_FILE):
+        print(f"[!] ERREUR : {CONFIG_FILE} introuvable et repo non disponible !")
         sys.exit(1)
+
+
+def load_config():
+    refresh_config_template()
 
     # Note: dConfig lit aussi les variables d'env en MAJUSCULE nativement.
     # Ce mapping sert uniquement à surcharger le config_template.ini avant
     # l'écriture des fichiers .ini finaux.
     env_map = {
         # Database
-        "MYSQL_HOST":                  ("Database",   "mysql_host"),
-        "MYSQL_PORT":                  ("Database",   "mysql_port"),
-        "MYSQL_DATABASE":              ("Database",   "mysql_database"),
-        "MYSQL_USER":                  ("Database",   "mysql_username"),
-        "MYSQL_PASSWORD":              ("Database",   "mysql_password"),
+        "MYSQL_HOST":             ("Database",   "mysql_host"),
+        "MYSQL_PORT":             ("Database",   "mysql_port"),
+        "MYSQL_DATABASE":         ("Database",   "mysql_database"),
+        "MYSQL_USER":             ("Database",   "mysql_username"),
+        "MYSQL_PASSWORD":         ("Database",   "mysql_password"),
         # General
-        "CLIENT_PATH":                 ("General",    "client_location"),
-        "USE_CUSTOM_FDB":              ("General",    "use_custom_fdb"),
-        "FDB_PATH":                    ("General",    "fdb_path"),
+        "CLIENT_PATH":            ("General",    "client_location"),
+        "USE_CUSTOM_FDB":         ("General",    "use_custom_fdb"),
+        "FDB_PATH":               ("General",    "fdb_path"),
         # Networking
-        "EXTERNAL_IP":                 ("Networking", "external_ip"),
-        "AUTH_SERVER_PORT":            ("Networking", "auth_server_port"),
-        "WORLD_SERVER_PORT":           ("Networking", "world_server_port"),
-        "WORLD_PORT_START":            ("Networking", "world_port_start"),
-        "CHAT_SERVER_PORT":            ("Networking", "chat_server_port"),
-        "MASTER_SERVER_PORT":          ("Networking", "master_server_port"),
+        "EXTERNAL_IP":            ("Networking", "external_ip"),
+        "AUTH_SERVER_PORT":       ("Networking", "auth_server_port"),
+        "WORLD_SERVER_PORT":      ("Networking", "world_server_port"),
+        "WORLD_PORT_START":       ("Networking", "world_port_start"),
+        "CHAT_SERVER_PORT":       ("Networking", "chat_server_port"),
+        "MASTER_SERVER_PORT":     ("Networking", "master_server_port"),
         # Gameplay
-        "MAX_OFFLINE_TIME":            ("Gameplay",   "max_offline_time"),
-        "KICK_AFTER_FAILED_AUTH":      ("Gameplay",   "kick_after_failed_auth"),
-        "ALLOW_MYTHRAN_COMMANDS":      ("Gameplay",   "allow_mythran_commands"),
-        "DISABLE_ANTI_CHEAT":          ("Gameplay",   "disable_anti_cheat"),
-        "CHATBOT_ENABLED":             ("Gameplay",   "chatbot_enabled"),
-        "LOG_ACTIVITY":                ("Gameplay",   "log_activity"),
+        "MAX_OFFLINE_TIME":       ("Gameplay",   "max_offline_time"),
+        "KICK_AFTER_FAILED_AUTH": ("Gameplay",   "kick_after_failed_auth"),
+        "ALLOW_MYTHRAN_COMMANDS": ("Gameplay",   "allow_mythran_commands"),
+        "DISABLE_ANTI_CHEAT":     ("Gameplay",   "disable_anti_cheat"),
+        "CHATBOT_ENABLED":        ("Gameplay",   "chatbot_enabled"),
+        "LOG_ACTIVITY":           ("Gameplay",   "log_activity"),
         # Logging
-        "LOG_LEVEL":                   ("Logging",    "log_level"),
-        "LOG_TO_CONSOLE":              ("Logging",    "log_to_console"),
-        "LOG_TO_FILE":                 ("Logging",    "log_to_file"),
+        "LOG_LEVEL":              ("Logging",    "log_level"),
+        "LOG_TO_CONSOLE":         ("Logging",    "log_to_console"),
+        "LOG_TO_FILE":            ("Logging",    "log_to_file"),
     }
 
     cfg = configparser.ConfigParser()
@@ -564,9 +574,9 @@ def write_config(cfg):
     mysql_pass = _cfg_get(cfg, "Database", "mysql_password", "")
 
     # --- General ---
-    client_loc      = _cfg_get(cfg, "General", "client_location", "/home/container/client")
-    use_custom_fdb  = _cfg_get(cfg, "General", "use_custom_fdb",  "0")
-    fdb_path        = _cfg_get(cfg, "General", "fdb_path",        "")
+    client_loc     = _cfg_get(cfg, "General", "client_location", "/home/container/client")
+    use_custom_fdb = _cfg_get(cfg, "General", "use_custom_fdb",  "0")
+    fdb_path       = _cfg_get(cfg, "General", "fdb_path",        "")
 
     # --- Networking ---
     external_ip      = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
@@ -690,7 +700,7 @@ def main():
     print("===================================================")
     print(" Darkflame Universe - Pterodactyl Python Container")
     print("===================================================")
-    cfg = load_config()
+    cfg = load_config()  # inclut refresh_config_template()
     if os.path.isfile(BINS_ZIP):
         install_runtime_deps()
         extract_prebuilt()
