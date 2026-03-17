@@ -70,19 +70,38 @@ def load_config():
         print(f"[!] ERREUR : {CONFIG_FILE} introuvable !")
         sys.exit(1)
 
+    # Note: dConfig lit aussi les variables d'env en MAJUSCULE nativement.
+    # Ce mapping sert uniquement à surcharger le config_template.ini avant
+    # l'écriture des fichiers .ini finaux.
     env_map = {
-        "MYSQL_HOST":         ("Database",   "mysql_host"),
-        "MYSQL_PORT":         ("Database",   "mysql_port"),
-        "MYSQL_DATABASE":     ("Database",   "mysql_database"),
-        "MYSQL_USER":         ("Database",   "mysql_username"),
-        "MYSQL_PASSWORD":     ("Database",   "mysql_password"),
-        "CLIENT_PATH":        ("General",    "client_location"),
-        "EXTERNAL_IP":        ("Networking", "external_ip"),
-        "AUTH_SERVER_PORT":   ("Networking", "auth_server_port"),
-        "WORLD_SERVER_PORT":  ("Networking", "world_server_port"),
-        "WORLD_PORT_START":   ("Networking", "world_port_start"),
-        "CHAT_SERVER_PORT":   ("Networking", "chat_server_port"),
-        "MASTER_SERVER_PORT": ("Networking", "master_server_port"),
+        # Database
+        "MYSQL_HOST":                  ("Database",   "mysql_host"),
+        "MYSQL_PORT":                  ("Database",   "mysql_port"),
+        "MYSQL_DATABASE":              ("Database",   "mysql_database"),
+        "MYSQL_USER":                  ("Database",   "mysql_username"),
+        "MYSQL_PASSWORD":              ("Database",   "mysql_password"),
+        # General
+        "CLIENT_PATH":                 ("General",    "client_location"),
+        "USE_CUSTOM_FDB":              ("General",    "use_custom_fdb"),
+        "FDB_PATH":                    ("General",    "fdb_path"),
+        # Networking
+        "EXTERNAL_IP":                 ("Networking", "external_ip"),
+        "AUTH_SERVER_PORT":            ("Networking", "auth_server_port"),
+        "WORLD_SERVER_PORT":           ("Networking", "world_server_port"),
+        "WORLD_PORT_START":            ("Networking", "world_port_start"),
+        "CHAT_SERVER_PORT":            ("Networking", "chat_server_port"),
+        "MASTER_SERVER_PORT":          ("Networking", "master_server_port"),
+        # Gameplay
+        "MAX_OFFLINE_TIME":            ("Gameplay",   "max_offline_time"),
+        "KICK_AFTER_FAILED_AUTH":      ("Gameplay",   "kick_after_failed_auth"),
+        "ALLOW_MYTHRAN_COMMANDS":      ("Gameplay",   "allow_mythran_commands"),
+        "DISABLE_ANTI_CHEAT":          ("Gameplay",   "disable_anti_cheat"),
+        "CHATBOT_ENABLED":             ("Gameplay",   "chatbot_enabled"),
+        "LOG_ACTIVITY":                ("Gameplay",   "log_activity"),
+        # Logging
+        "LOG_LEVEL":                   ("Logging",    "log_level"),
+        "LOG_TO_CONSOLE":              ("Logging",    "log_to_console"),
+        "LOG_TO_FILE":                 ("Logging",    "log_to_file"),
     }
 
     cfg = configparser.ConfigParser()
@@ -537,25 +556,50 @@ def write_config(cfg):
     print("\n[=] Écriture de la configuration...")
     os.makedirs(BUILD_DIR, exist_ok=True)
 
-    external_ip   = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
-    auth_port     = _cfg_get(cfg, "Networking", "auth_server_port",   "25896")
-    world_port    = _cfg_get(cfg, "Networking", "world_server_port",  "25740")
-    world_port_start = _cfg_get(cfg, "Networking", "world_port_start", world_port)
-    chat_port     = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
-    master_port   = _cfg_get(cfg, "Networking", "master_server_port", "25846")
-    mysql_host    = _cfg_get(cfg, "Database",   "mysql_host",         "")
-    mysql_port    = _cfg_get(cfg, "Database",   "mysql_port",         "3306")
-    mysql_db      = _cfg_get(cfg, "Database",   "mysql_database",     "")
-    mysql_user    = _cfg_get(cfg, "Database",   "mysql_username",     "")
-    mysql_pass    = _cfg_get(cfg, "Database",   "mysql_password",     "")
-    client_loc    = _cfg_get(cfg, "General",    "client_location",    "/home/container/client")
+    # --- Database ---
+    mysql_host = _cfg_get(cfg, "Database", "mysql_host",     "")
+    mysql_port = _cfg_get(cfg, "Database", "mysql_port",     "3306")
+    mysql_db   = _cfg_get(cfg, "Database", "mysql_database", "")
+    mysql_user = _cfg_get(cfg, "Database", "mysql_username", "")
+    mysql_pass = _cfg_get(cfg, "Database", "mysql_password", "")
 
-    print(f"[=] external_ip        = {external_ip}")
-    print(f"[=] auth_server_port   = {auth_port}")
-    print(f"[=] world_server_port  = {world_port}")
-    print(f"[=] world_port_start   = {world_port_start}")
-    print(f"[=] chat_server_port   = {chat_port}")
-    print(f"[=] master_server_port = {master_port}")
+    # --- General ---
+    client_loc      = _cfg_get(cfg, "General", "client_location", "/home/container/client")
+    use_custom_fdb  = _cfg_get(cfg, "General", "use_custom_fdb",  "0")
+    fdb_path        = _cfg_get(cfg, "General", "fdb_path",        "")
+
+    # --- Networking ---
+    external_ip      = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
+    auth_port        = _cfg_get(cfg, "Networking", "auth_server_port",   "25896")
+    world_port       = _cfg_get(cfg, "Networking", "world_server_port",  "25740")
+    world_port_start = _cfg_get(cfg, "Networking", "world_port_start",   world_port)
+    chat_port        = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
+    master_port      = _cfg_get(cfg, "Networking", "master_server_port", "25846")
+
+    # --- Gameplay ---
+    max_offline_time       = _cfg_get(cfg, "Gameplay", "max_offline_time",       "0")
+    kick_after_failed_auth = _cfg_get(cfg, "Gameplay", "kick_after_failed_auth", "1")
+    allow_mythran_commands = _cfg_get(cfg, "Gameplay", "allow_mythran_commands", "0")
+    disable_anti_cheat     = _cfg_get(cfg, "Gameplay", "disable_anti_cheat",     "0")
+    chatbot_enabled        = _cfg_get(cfg, "Gameplay", "chatbot_enabled",        "0")
+    log_activity           = _cfg_get(cfg, "Gameplay", "log_activity",           "0")
+
+    # --- Logging ---
+    log_level      = _cfg_get(cfg, "Logging", "log_level",      "2")
+    log_to_console = _cfg_get(cfg, "Logging", "log_to_console", "1")
+    log_to_file    = _cfg_get(cfg, "Logging", "log_to_file",    "0")
+
+    print(f"[=] external_ip              = {external_ip}")
+    print(f"[=] auth_server_port         = {auth_port}")
+    print(f"[=] world_server_port        = {world_port}")
+    print(f"[=] world_port_start         = {world_port_start}")
+    print(f"[=] chat_server_port         = {chat_port}")
+    print(f"[=] master_server_port       = {master_port}")
+    print(f"[=] max_offline_time         = {max_offline_time}")
+    print(f"[=] kick_after_failed_auth   = {kick_after_failed_auth}")
+    print(f"[=] allow_mythran_commands   = {allow_mythran_commands}")
+    print(f"[=] disable_anti_cheat       = {disable_anti_cheat}")
+    print(f"[=] use_custom_fdb           = {use_custom_fdb}")
 
     if external_ip == "0.0.0.0":
         print("[!] ATTENTION : external_ip=0.0.0.0 — les clients ne pourront pas se connecter !")
@@ -571,10 +615,21 @@ def write_config(cfg):
         f"\n"
         f"[General]\n"
         f"client_location={client_loc}\n"
+        f"use_custom_fdb={use_custom_fdb}\n"
+        f"fdb_path={fdb_path}\n"
+        f"\n"
+        f"[Gameplay]\n"
+        f"max_offline_time={max_offline_time}\n"
+        f"kick_after_failed_auth={kick_after_failed_auth}\n"
+        f"allow_mythran_commands={allow_mythran_commands}\n"
+        f"disable_anti_cheat={disable_anti_cheat}\n"
+        f"chatbot_enabled={chatbot_enabled}\n"
+        f"log_activity={log_activity}\n"
         f"\n"
         f"[Logging]\n"
-        f"log_level=2\n"
-        f"log_to_console=1\n"
+        f"log_level={log_level}\n"
+        f"log_to_console={log_to_console}\n"
+        f"log_to_file={log_to_file}\n"
         f"\n"
     )
 
