@@ -44,7 +44,7 @@ PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
 PLAYIT_BIN   = os.path.join(HOME_DIR, "playit")
-PLAYIT_DIR   = os.path.join(HOME_DIR, "playit-data")
+PLAYIT_LOG   = os.path.join(HOME_DIR, "playit.log")
 PLAYIT_URL   = "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64"
 
 DFS_TARBALL_URL = "https://github.com/DarkflameUniverse/DarkflameServer/archive/refs/heads/main.tar.gz"
@@ -629,37 +629,12 @@ def check_client_files(cfg):
     print(f"[✓] Fichiers client OK à {client_path}")
 
 
-def _search_claim_in_files(search_dirs):
-    """Cherche un claim URL dans tous les fichiers texte de search_dirs."""
-    claim_url = None
-    for d in search_dirs:
-        if not os.path.isdir(d):
-            continue
-        for root, _, files in os.walk(d):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, 'r', errors='replace') as f:
-                        content = f.read()
-                    if 'playit.gg/claim' in content:
-                        for line in content.splitlines():
-                            if 'playit.gg/claim' in line:
-                                claim_url = line.strip()
-                                break
-                    if claim_url:
-                        print(f"[=] Claim trouvé dans : {fpath}")
-                        return claim_url
-                except Exception:
-                    pass
-    return None
-
-
 def start_playit():
     """
-    Lance playit avec --data-dir pour forcer l'écriture de ses fichiers
-    de configuration dans un dossier connu.
-    Attend que playit écrive le claim URL dans ses fichiers de config,
-    puis affiche l'URL et relance en daemon.
+    Lance playit sans argument supplémentaire.
+    Redirige stdout+stderr vers playit.log.
+    Lit le fichier en polling pour trouver le claim URL.
+    Cherche aussi dans ~/.config/playit/ les fichiers générés.
     """
     print("\n[=] Démarrage de playit.gg...")
 
@@ -676,60 +651,82 @@ def start_playit():
     env = os.environ.copy()
     playit_secret = os.environ.get("PLAYIT_SECRET", "")
 
-    os.makedirs(PLAYIT_DIR, exist_ok=True)
-
     if playit_secret:
         env["PLAYIT_SECRET"] = playit_secret
         print("[=] PLAYIT_SECRET défini → lancement daemon direct.")
-        log_path = os.path.join(PLAYIT_DIR, "playit.log")
-        with open(log_path, "w") as lf:
+        with open(PLAYIT_LOG, "w") as lf:
             subprocess.Popen(
-                [PLAYIT_BIN, "--data-dir", PLAYIT_DIR],
-                env=env, stdout=lf, stderr=subprocess.STDOUT,
+                [PLAYIT_BIN], env=env,
+                stdout=lf, stderr=subprocess.STDOUT,
                 close_fds=True,
             )
         print("[✓] playit daemon actif.")
         time.sleep(3)
         return
 
-    # Pas de secret : on attend que playit écrive le claim URL dans ses fichiers
-    print("[!] PLAYIT_SECRET non défini.")
-    print(f"[=] Lancement playit --data-dir {PLAYIT_DIR} (20s)...")
+    print("[!] PLAYIT_SECRET non défini — attente du claim code...")
+    print(f"[=] Lancement playit, lecture de {PLAYIT_LOG} (30s)...")
 
-    log_path = os.path.join(PLAYIT_DIR, "playit.log")
-    with open(log_path, "w") as lf:
+    # Lance playit, stdout+stderr → fichier
+    with open(PLAYIT_LOG, "w") as lf:
         proc = subprocess.Popen(
-            [PLAYIT_BIN, "--data-dir", PLAYIT_DIR],
-            env=env,
-            stdout=lf,
-            stderr=subprocess.STDOUT,
+            [PLAYIT_BIN], env=env,
+            stdout=lf, stderr=subprocess.STDOUT,
             close_fds=True,
         )
 
-    # Poll pendant 20s : cherche le claim dans playit.log ET dans les fichiers du data-dir
+    # Dossiers où playit peut écrire des fichiers de config
+    config_dirs = [
+        os.path.join(HOME_DIR, ".config", "playit"),
+        os.path.join(HOME_DIR, ".local", "share", "playit"),
+        HOME_DIR,
+    ]
+
     claim_url = None
-    for i in range(20):
+    for i in range(30):
         time.sleep(1)
-        # Cherche dans le log
+
+        # Lis le log principal
         try:
-            with open(log_path, 'r', errors='replace') as f:
-                for line in f:
-                    clean = strip_ansi_bytes(line.encode()).decode('utf-8', errors='replace')
-                    if 'playit.gg/claim' in clean:
-                        claim_url = clean.strip()
-                        break
+            with open(PLAYIT_LOG, 'rb') as f:
+                raw = f.read()
+            clean = strip_ansi_bytes(raw).decode('utf-8', errors='replace')
+            for line in clean.splitlines():
+                if 'playit.gg/claim' in line:
+                    claim_url = line.strip()
+                    break
         except Exception:
             pass
+
+        if not claim_url:
+            # Cherche aussi dans les fichiers de config générés par playit
+            for d in config_dirs:
+                if not os.path.isdir(d):
+                    continue
+                for fname in os.listdir(d):
+                    fpath = os.path.join(d, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    try:
+                        with open(fpath, 'r', errors='replace') as f:
+                            content = f.read()
+                        if 'playit.gg/claim' in content:
+                            for line in content.splitlines():
+                                if 'playit.gg/claim' in line:
+                                    claim_url = line.strip()
+                                    print(f"[=] Claim trouvé dans : {fpath}")
+                                    break
+                    except Exception:
+                        pass
+                if claim_url:
+                    break
+
         if claim_url:
             break
-        # Cherche dans tous les fichiers du data-dir (toml, json, txt...)
-        claim_url = _search_claim_in_files([PLAYIT_DIR])
-        if claim_url:
-            break
+
         if (i + 1) % 5 == 0:
             print(f"[=] Attente claim... {i+1}s")
 
-    # Affichage
     if claim_url:
         print(f"")
         print(f"[>>>] ==========================================")
@@ -739,26 +736,35 @@ def start_playit():
         print(f"[>>>] ==========================================")
         print(f"")
     else:
-        # Dump tout le contenu du data-dir pour debug
-        print("[!] Claim code non trouvé après 20s.")
-        print(f"[=] Contenu de {PLAYIT_DIR} :")
-        for root, dirs, files in os.walk(PLAYIT_DIR):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                print(f"    [fichier] {fpath}")
+        # Dump complet du log pour debug
+        print("[!] Claim code non trouvé après 30s. Contenu de playit.log :")
+        try:
+            with open(PLAYIT_LOG, 'rb') as f:
+                raw = f.read()
+            clean = strip_ansi_bytes(raw).decode('utf-8', errors='replace')
+            for line in clean.splitlines():
+                if line.strip():
+                    print(f"  {line}")
+        except Exception as e:
+            print(f"  [erreur lecture: {e}]")
+        # Dump aussi les fichiers de config
+        print(f"[=] Fichiers dans ~/.config/playit/ :")
+        cfg_dir = os.path.join(HOME_DIR, ".config", "playit")
+        if os.path.isdir(cfg_dir):
+            for fname in os.listdir(cfg_dir):
+                fpath = os.path.join(cfg_dir, fname)
+                print(f"  [fichier] {fpath}")
                 try:
                     with open(fpath, 'r', errors='replace') as f:
-                        content = f.read(4096)
-                    clean = strip_ansi_bytes(content.encode()).decode('utf-8', errors='replace')
-                    for line in clean.splitlines()[:20]:
-                        if line.strip():
-                            print(f"      {line}")
-                except Exception as e:
-                    print(f"      [erreur lecture: {e}]")
+                        for line in f.read(2048).splitlines()[:30]:
+                            if line.strip():
+                                print(f"    {line}")
+                except Exception:
+                    pass
+        else:
+            print("  (dossier absent)")
 
-    # Laisse playit tourner en daemon (il est déjà en background)
-    print("[✓] playit daemon actif (PID conservé).")
-    time.sleep(2)
+    print("[✓] playit actif en arrière-plan.")
 
 
 def start_server():
