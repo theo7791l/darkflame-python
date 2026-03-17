@@ -6,8 +6,6 @@ pour container Python Pterodactyl avec DB externe
 
 import os
 import re
-import pty
-import select
 import subprocess
 import sys
 import shutil
@@ -17,6 +15,7 @@ import urllib.request
 import tarfile
 import io
 import time
+import signal
 
 def pip_install(pkg):
     subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
@@ -629,35 +628,12 @@ def check_client_files(cfg):
     print(f"[✓] Fichiers client OK à {client_path}")
 
 
-def _read_pty_output(master_fd, timeout_sec=10):
-    """
-    Lit l'output d'un fd PTY pendant timeout_sec secondes.
-    Retourne les bytes bruts accumulés.
-    """
-    buf = b""
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        remaining = deadline - time.time()
-        try:
-            rlist, _, _ = select.select([master_fd], [], [], min(remaining, 0.5))
-        except (ValueError, OSError):
-            break
-        if rlist:
-            try:
-                chunk = os.read(master_fd, 4096)
-                if not chunk:
-                    break
-                buf += chunk
-            except OSError:
-                break
-    return buf
-
-
 def start_playit():
     """
-    Lance playit.gg via un faux PTY (module pty) pour capturer l'output de la TUI,
-    strippe les séquences ANSI, et affiche le claim code proprement.
-    Si PLAYIT_SECRET est défini, il est passé en variable d'env.
+    Lance playit.gg via 'script -q' pour lui fournir un vrai PTY,
+    capture l'output brut dans playit-raw.log, strippe les ANSI,
+    puis affiche et sauvegarde dans playit.log.
+    Ensuite relance playit en vrai daemon en arrière-plan.
     """
     print("\n[=] Démarrage de playit.gg...")
 
@@ -675,55 +651,100 @@ def start_playit():
     playit_secret = os.environ.get("PLAYIT_SECRET", "")
     if playit_secret:
         env["PLAYIT_SECRET"] = playit_secret
-        print("[=] Lancement playit avec secret configuré...")
-    else:
-        print("[!] PLAYIT_SECRET non défini — le claim code va apparaître ci-dessous.")
+        print("[=] PLAYIT_SECRET défini, playit va se connecter automatiquement.")
+        # Lance directement en daemon, pas besoin de claim code
+        log_path = os.path.join(HOME_DIR, "playit.log")
+        with open(log_path, "w") as lf:
+            subprocess.Popen([PLAYIT_BIN], env=env, stdout=lf,
+                             stderr=subprocess.STDOUT, close_fds=True)
+        print("[✓] playit lancé en daemon.")
+        time.sleep(3)
+        return
 
-    log_path = os.path.join(HOME_DIR, "playit.log")
+    # Pas de secret : on a besoin de voir le claim code
+    # Utilise 'script -q' pour forcer un PTY et capturer la TUI
+    raw_log  = os.path.join(HOME_DIR, "playit-raw.log")
+    clean_log = os.path.join(HOME_DIR, "playit.log")
 
-    # Crée un faux PTY pour que playit pense avoir un terminal
-    master_fd, slave_fd = pty.openpty()
-    try:
-        proc = subprocess.Popen(
-            [PLAYIT_BIN],
-            env=env,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            close_fds=True,
-        )
-        os.close(slave_fd)  # le parent n'en a plus besoin
-        slave_fd = -1
-        print(f"[✓] playit lancé (PID {proc.pid}), lecture 12s...")
+    # Vérifie si script est dispo
+    has_script = shutil.which("script") is not None
 
-        raw = _read_pty_output(master_fd, timeout_sec=12)
-    finally:
+    if has_script:
+        print("[=] Capture via 'script -q' (15s)...")
         try:
-            os.close(master_fd)
-        except OSError:
-            pass
-        if slave_fd != -1:
+            # script -q -c CMD FILE  -> enregistre dans FILE et quitte quand CMD quitte
+            # On tue playit après 15s pour ne pas bloquer
+            proc = subprocess.Popen(
+                ["script", "-q", "-c", f"{PLAYIT_BIN}", raw_log],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            time.sleep(15)
             try:
-                os.close(slave_fd)
-            except OSError:
+                proc.send_signal(signal.SIGTERM)
+            except Exception:
                 pass
+        except Exception as e:
+            print(f"[!] script -q a échoué : {e}")
+            has_script = False
 
-    # Sauvegarde raw + version propre dans playit.log
-    clean = strip_ansi_bytes(raw).decode("utf-8", errors="replace")
-    with open(log_path, "w") as lf:
-        lf.write(clean)
+    if not has_script:
+        # Fallback : lance playit normalement 15s et lit le fichier log
+        print("[=] Fallback : lecture directe de playit (15s)...")
+        with open(raw_log, "wb") as lf:
+            proc = subprocess.Popen(
+                [PLAYIT_BIN], env=env,
+                stdout=lf, stderr=subprocess.STDOUT,
+                close_fds=True,
+            )
+        time.sleep(15)
+        try:
+            proc.send_signal(signal.SIGTERM)
+        except Exception:
+            pass
 
-    lines = [l for l in clean.splitlines() if l.strip()]
+    # Lecture et nettoyage
+    try:
+        with open(raw_log, "rb") as f:
+            raw = f.read()
+        clean = strip_ansi_bytes(raw).decode("utf-8", errors="replace")
+        with open(clean_log, "w") as f:
+            f.write(clean)
+        lines = [l for l in clean.splitlines() if l.strip()]
+    except Exception as e:
+        print(f"[!] Erreur lecture log playit : {e}")
+        lines = []
+
     if lines:
         print("[=] ===== PLAYIT LOGS =====")
-        for line in lines[:30]:
+        for line in lines[:40]:
             print(f"    {line}")
         print("[=] ======================")
+        claim_found = False
         for line in lines:
-            if "playit.gg/claim" in line or ("claim" in line.lower() and "http" in line.lower()):
-                print(f"[>>>] CLAIM CODE : {line.strip()}")
+            if "playit.gg/claim" in line:
+                print(f"")
+                print(f"[>>>] CLAIM CODE DETECTE :")
+                print(f"[>>>]   {line.strip()}")
+                print(f"[>>>] Ouvrez ce lien pour lier playit à votre compte.")
+                print(f"")
+                claim_found = True
+        if not claim_found:
+            print("[!] Claim code non trouvé dans les logs. Vérifiez playit.log")
     else:
-        print("[!] Aucun output playit après 12s.")
+        print("[!] playit.log vide. Vérifiez que le binaire fonctionne.")
+
+    # Relance en vrai daemon pour que le tunnel reste actif
+    print("[=] Relance de playit en daemon...")
+    with open(clean_log, "a") as lf:
+        subprocess.Popen([PLAYIT_BIN], env=env,
+                         stdout=lf, stderr=subprocess.STDOUT,
+                         close_fds=True)
+    print("[✓] playit daemon actif.")
+    time.sleep(2)
 
 
 def start_server():
