@@ -14,6 +14,7 @@ import configparser
 import urllib.request
 import tarfile
 import io
+import uuid
 
 def pip_install(pkg):
     subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
@@ -23,6 +24,13 @@ try:
 except ImportError:
     print("[=] Installation de pymysql...")
     pip_install("pymysql")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+try:
+    import bcrypt
+except ImportError:
+    print("[=] Installation de bcrypt...")
+    pip_install("bcrypt")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 try:
@@ -66,6 +74,152 @@ GLIBC_DEBS = [
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
 
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+def get_db_conn(cfg):
+    return pymysql.connect(
+        host=cfg.get("Database", "mysql_host"),
+        port=int(cfg.get("Database", "mysql_port", fallback="3306")),
+        user=cfg.get("Database", "mysql_username"),
+        password=cfg.get("Database", "mysql_password"),
+        database=cfg.get("Database", "mysql_database"),
+        connect_timeout=10,
+        autocommit=True,
+    )
+
+
+def hash_password(plain: str) -> str:
+    """Retourne le hash bcrypt compatible DarkflameServer."""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+
+def create_play_key(cursor) -> int:
+    """Insère une nouvelle play key active et retourne son id."""
+    key_string = str(uuid.uuid4()).upper()[:20]
+    cursor.execute(
+        "INSERT INTO play_keys (key_string, created_at, key_uses, active) VALUES (%s, NOW(), 99, 1);",
+        (key_string,)
+    )
+    return cursor.lastrowid
+
+
+def create_account(cfg, username: str, password: str, gm_level: int = 9, with_play_key: bool = True):
+    """
+    Crée un compte DarkflameServer avec bcrypt + play key auto.
+    gm_level : 9 = Mythran (admin), 0 = joueur normal
+    """
+    conn = get_db_conn(cfg)
+    try:
+        with conn.cursor() as cur:
+            # Vérifier si le compte existe déjà
+            cur.execute("SELECT id FROM accounts WHERE name = %s LIMIT 1;", (username,))
+            if cur.fetchone():
+                print(f"[!] Le compte '{username}' existe déjà, skip.")
+                return False
+
+            hashed = hash_password(password)
+
+            if with_play_key:
+                play_key_id = create_play_key(cur)
+                cur.execute(
+                    "INSERT INTO accounts (name, password, gm_level, play_key_id) VALUES (%s, %s, %s, %s);",
+                    (username, hashed, gm_level, play_key_id)
+                )
+                print(f"[✓] Compte '{username}' créé (gm_level={gm_level}, play_key_id={play_key_id}).")
+            else:
+                cur.execute(
+                    "INSERT INTO accounts (name, password, gm_level) VALUES (%s, %s, %s);",
+                    (username, hashed, gm_level)
+                )
+                print(f"[✓] Compte '{username}' créé (gm_level={gm_level}, sans play key).")
+
+        return True
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Création du premier compte admin (premier démarrage)
+# ---------------------------------------------------------------------------
+
+def setup_first_account(cfg):
+    """
+    Si aucun compte n'existe en DB, demande de créer un compte admin
+    avec play key attribuée automatiquement.
+    """
+    conn = get_db_conn(cfg)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM accounts;")
+            count = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    if count > 0:
+        print(f"[✓] {count} compte(s) existant(s) en DB, skip création admin.")
+        return
+
+    print("\n" + "=" * 50)
+    print(" PREMIER DÉMARRAGE — Création du compte administrateur")
+    print("=" * 50)
+
+    admin_user = os.environ.get("ADMIN_USERNAME", "").strip()
+    admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
+
+    if admin_user and admin_pass:
+        print(f"[=] Création auto depuis les variables d'env (ADMIN_USERNAME / ADMIN_PASSWORD)...")
+    else:
+        print("[=] Aucune variable ADMIN_USERNAME/ADMIN_PASSWORD détectée.")
+        print("[=] Définissez ces variables d'env dans Pterodactyl pour créer un admin auto.")
+        print("[!] Aucun compte créé. Utilisez : python install.py --add-account <nom> <mdp>")
+        return
+
+    create_account(cfg, admin_user, admin_pass, gm_level=9, with_play_key=True)
+    print("[✓] Compte admin prêt — vous pouvez vous connecter directement.")
+
+
+# ---------------------------------------------------------------------------
+# Commande --add-account
+# ---------------------------------------------------------------------------
+
+def cmd_add_account(cfg, args):
+    """
+    Usage : python install.py --add-account <nom> <mdp> [--gm <niveau>]
+    Niveaux GM : 0=joueur, 1=junior moderateur, 3=moderateur, 5=operateur, 9=mythran(admin)
+    """
+    if len(args) < 2:
+        print("Usage : python install.py --add-account <nom> <mdp> [--gm <niveau>]")
+        print("  --gm 0  = joueur normal (défaut)")
+        print("  --gm 9  = admin Mythran")
+        sys.exit(1)
+
+    username = args[0]
+    password = args[1]
+    gm_level = 0
+
+    if "--gm" in args:
+        idx = args.index("--gm")
+        if idx + 1 < len(args):
+            try:
+                gm_level = int(args[idx + 1])
+            except ValueError:
+                print("[!] Niveau GM invalide, utilisation de 0.")
+
+    print(f"\n[=] Création du compte '{username}' (gm_level={gm_level})...")
+    cfg = load_config()
+    test_db_connection(cfg)
+    success = create_account(cfg, username, password, gm_level=gm_level, with_play_key=True)
+    if success:
+        print(f"[✓] Compte '{username}' créé avec play key auto.")
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 def refresh_config_template():
     """Toujours écraser config_template.ini depuis le repo cloné pour éviter les sections périmées."""
     repo_cfg = os.path.join(REPO_DIR, "config_template.ini")
@@ -80,9 +234,6 @@ def refresh_config_template():
 def load_config():
     refresh_config_template()
 
-    # Note: dConfig lit aussi les variables d'env en MAJUSCULE nativement.
-    # Ce mapping sert uniquement à surcharger le config_template.ini avant
-    # l'écriture des fichiers .ini finaux.
     env_map = {
         # Database
         "MYSQL_HOST":             ("Database",   "mysql_host"),
@@ -566,19 +717,16 @@ def write_config(cfg):
     print("\n[=] Écriture de la configuration...")
     os.makedirs(BUILD_DIR, exist_ok=True)
 
-    # --- Database ---
     mysql_host = _cfg_get(cfg, "Database", "mysql_host",     "")
     mysql_port = _cfg_get(cfg, "Database", "mysql_port",     "3306")
     mysql_db   = _cfg_get(cfg, "Database", "mysql_database", "")
     mysql_user = _cfg_get(cfg, "Database", "mysql_username", "")
     mysql_pass = _cfg_get(cfg, "Database", "mysql_password", "")
 
-    # --- General ---
     client_loc     = _cfg_get(cfg, "General", "client_location", "/home/container/client")
     use_custom_fdb = _cfg_get(cfg, "General", "use_custom_fdb",  "0")
     fdb_path       = _cfg_get(cfg, "General", "fdb_path",        "")
 
-    # --- Networking ---
     external_ip      = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
     auth_port        = _cfg_get(cfg, "Networking", "auth_server_port",   "25896")
     world_port       = _cfg_get(cfg, "Networking", "world_server_port",  "25740")
@@ -586,7 +734,6 @@ def write_config(cfg):
     chat_port        = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
     master_port      = _cfg_get(cfg, "Networking", "master_server_port", "25846")
 
-    # --- Gameplay ---
     max_offline_time       = _cfg_get(cfg, "Gameplay", "max_offline_time",       "0")
     kick_after_failed_auth = _cfg_get(cfg, "Gameplay", "kick_after_failed_auth", "1")
     allow_mythran_commands = _cfg_get(cfg, "Gameplay", "allow_mythran_commands", "0")
@@ -594,7 +741,6 @@ def write_config(cfg):
     chatbot_enabled        = _cfg_get(cfg, "Gameplay", "chatbot_enabled",        "0")
     log_activity           = _cfg_get(cfg, "Gameplay", "log_activity",           "0")
 
-    # --- Logging ---
     log_level      = _cfg_get(cfg, "Logging", "log_level",      "2")
     log_to_console = _cfg_get(cfg, "Logging", "log_to_console", "1")
     log_to_file    = _cfg_get(cfg, "Logging", "log_to_file",    "0")
@@ -697,10 +843,19 @@ def start_server():
 
 
 def main():
+    # --- Commande --add-account ---
+    if "--add-account" in sys.argv:
+        idx = sys.argv.index("--add-account")
+        extra_args = sys.argv[idx + 1:]
+        cfg = load_config()
+        test_db_connection(cfg)
+        cmd_add_account(cfg, extra_args)
+        return  # sys.exit appelé dans cmd_add_account
+
     print("===================================================")
     print(" Darkflame Universe - Pterodactyl Python Container")
     print("===================================================")
-    cfg = load_config()  # inclut refresh_config_template()
+    cfg = load_config()
     if os.path.isfile(BINS_ZIP):
         install_runtime_deps()
         extract_prebuilt()
@@ -713,6 +868,7 @@ def main():
     test_db_connection(cfg)
     write_config(cfg)
     setup_server_data(cfg)
+    setup_first_account(cfg)   # <-- création auto admin au premier démarrage
     start_server()
 
 
