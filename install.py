@@ -80,6 +80,7 @@ def load_config():
         "EXTERNAL_IP":        ("Networking", "external_ip"),
         "AUTH_SERVER_PORT":   ("Networking", "auth_server_port"),
         "WORLD_SERVER_PORT":  ("Networking", "world_server_port"),
+        "WORLD_PORT_START":   ("Networking", "world_port_start"),
         "CHAT_SERVER_PORT":   ("Networking", "chat_server_port"),
         "MASTER_SERVER_PORT": ("Networking", "master_server_port"),
     }
@@ -539,6 +540,7 @@ def write_config(cfg):
     external_ip   = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
     auth_port     = _cfg_get(cfg, "Networking", "auth_server_port",   "25896")
     world_port    = _cfg_get(cfg, "Networking", "world_server_port",  "25740")
+    world_port_start = _cfg_get(cfg, "Networking", "world_port_start", world_port)
     chat_port     = _cfg_get(cfg, "Networking", "chat_server_port",   "25784")
     master_port   = _cfg_get(cfg, "Networking", "master_server_port", "25846")
     mysql_host    = _cfg_get(cfg, "Database",   "mysql_host",         "")
@@ -548,15 +550,16 @@ def write_config(cfg):
     mysql_pass    = _cfg_get(cfg, "Database",   "mysql_password",     "")
     client_loc    = _cfg_get(cfg, "General",    "client_location",    "/home/container/client")
 
-    print(f"[=] external_ip       = {external_ip}")
-    print(f"[=] auth_server_port  = {auth_port}")
-    print(f"[=] world_server_port = {world_port}")
-    print(f"[=] chat_server_port  = {chat_port}")
-    print(f"[=] master_server_port= {master_port}")
+    print(f"[=] external_ip        = {external_ip}")
+    print(f"[=] auth_server_port   = {auth_port}")
+    print(f"[=] world_server_port  = {world_port}")
+    print(f"[=] world_port_start   = {world_port_start}")
+    print(f"[=] chat_server_port   = {chat_port}")
+    print(f"[=] master_server_port = {master_port}")
 
     if external_ip == "0.0.0.0":
         print("[!] ATTENTION : external_ip=0.0.0.0 — les clients ne pourront pas se connecter !")
-        print("[!] Ajoutez la variable d'env EXTERNAL_IP=<votre_ip_publique> dans FeatherPanel.")
+        print("[!] Ajoutez la variable d'env EXTERNAL_IP=<votre_ip_publique> dans Pterodactyl.")
 
     common = (
         f"[Database]\n"
@@ -579,6 +582,7 @@ def write_config(cfg):
         f"external_ip={external_ip}\n"
         f"auth_server_port={auth_port}\n"
         f"world_server_port={world_port}\n"
+        f"world_port_start={world_port_start}\n"
         f"chat_server_port={chat_port}\n"
         f"master_server_port={master_port}\n"
     )
