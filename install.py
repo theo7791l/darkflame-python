@@ -41,8 +41,8 @@ PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
 
-# Répertoire pour le clone sparse de DarkflameServer (navmeshes uniquement)
-DFS_SPARSE_DIR = os.path.join(HOME_DIR, ".dfs-sparse")
+# navmeshes.zip téléchargé depuis le repo DarkflameServer (resources/)
+NAVMESHES_URL = "https://github.com/DarkflameUniverse/DarkflameServer/raw/main/resources/navmeshes.zip"
 
 BINARY_NAMES = {
     "master": ["MasterServer", "masterserver"],
@@ -369,46 +369,50 @@ def extract_prebuilt():
 
 def fetch_navmeshes():
     """
-    Récupère le dossier navmeshes depuis le repo DarkflameServer via sparse-checkout.
-    navmeshes/ est dans le repo source, pas dans le client LEGO Universe.
+    Télécharge resources/navmeshes.zip depuis DarkflameServer
+    et extrait les .bin dans BUILD_DIR/res/maps/navmeshes/
+    
+    La vérification se fait sur le dossier final attendu par MasterServer :
+      darkflame-build/navmeshes/   (chemin vérifié par MasterServer.cpp:112)
     """
+    # MasterServer cherche navmeshes/ à côté du binaire (dans BUILD_DIR)
     dest = os.path.join(BUILD_DIR, "navmeshes")
-    if os.path.isdir(dest):
+    if os.path.isdir(dest) and any(f.endswith(".bin") for f in os.listdir(dest)):
         print("[✓] navmeshes/ déjà présent, skip.")
         return
 
-    print("[=] Récupération navmeshes depuis DarkflameServer...")
-    os.makedirs(DFS_SPARSE_DIR, exist_ok=True)
+    print("[=] Téléchargement navmeshes.zip depuis DarkflameServer/resources...")
+    zip_path = os.path.join(HOME_DIR, "navmeshes.zip")
+    try:
+        download_file(NAVMESHES_URL, zip_path)
+    except Exception as e:
+        print(f"[!] Échec téléchargement navmeshes.zip : {e}")
+        sys.exit(1)
 
-    # Init repo vide si pas encore fait
-    if not os.path.isdir(os.path.join(DFS_SPARSE_DIR, ".git")):
-        run(f"git init {DFS_SPARSE_DIR}", check=False)
-        run(f"git -C {DFS_SPARSE_DIR} remote add origin https://github.com/DarkflameUniverse/DarkflameServer.git", check=False)
+    os.makedirs(dest, exist_ok=True)
+    print(f"[=] Extraction navmeshes.zip → {dest} ...")
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        for member in z.namelist():
+            filename = os.path.basename(member)
+            if not filename or not filename.endswith(".bin"):
+                continue
+            with z.open(member) as src, open(os.path.join(dest, filename), 'wb') as out:
+                shutil.copyfileobj(src, out)
 
-    # Sparse checkout sur navmeshes/ uniquement
-    run(f"git -C {DFS_SPARSE_DIR} config core.sparseCheckout true", check=False)
-    sparse_file = os.path.join(DFS_SPARSE_DIR, ".git", "info", "sparse-checkout")
-    with open(sparse_file, "w") as f:
-        f.write("navmeshes/\n")
+    bin_count = len([f for f in os.listdir(dest) if f.endswith(".bin")])
+    os.remove(zip_path)
 
-    # Pull uniquement les fichiers nécessaires (depth=1)
-    r = run(f"git -C {DFS_SPARSE_DIR} pull --depth=1 origin main", check=False)
-    if r.returncode != 0:
-        # Essayer avec 'dev' si 'main' échoue
-        r = run(f"git -C {DFS_SPARSE_DIR} pull --depth=1 origin dev", check=False)
+    if bin_count == 0:
+        print("[!] ERREUR : navmeshes.zip ne contenait aucun .bin !")
+        sys.exit(1)
 
-    src_navmeshes = os.path.join(DFS_SPARSE_DIR, "navmeshes")
-    if os.path.isdir(src_navmeshes):
-        shutil.copytree(src_navmeshes, dest)
-        print(f"[✓] navmeshes/ copié dans {BUILD_DIR}")
-    else:
-        print("[!] navmeshes/ introuvable dans DarkflameServer — le serveur continuera sans (non bloquant).")
+    print(f"[✓] {bin_count} navmesh(es) extrait(s) dans {dest}")
 
 
 def setup_server_data(cfg):
     """
     Copie res/ et locale/ depuis le client vers BUILD_DIR.
-    Récupère navmeshes/ depuis le repo DarkflameServer.
+    Télécharge et extrait navmeshes/ depuis DarkflameServer/resources/navmeshes.zip.
     """
     print("\n[=] Vérification des données serveur (navmeshes, res, locale)...")
     client_path = cfg.get("General", "client_location", fallback="/home/container/client")
@@ -430,7 +434,7 @@ def setup_server_data(cfg):
             print(f"[!] ERREUR : {src} introuvable dans le client !")
             sys.exit(1)
 
-    # navmeshes vient du repo DarkflameServer
+    # navmeshes vient de DarkflameServer/resources/navmeshes.zip
     fetch_navmeshes()
 
     # Créer le dossier logs
