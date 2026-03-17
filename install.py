@@ -14,7 +14,6 @@ import configparser
 import urllib.request
 import tarfile
 import io
-import time
 
 def pip_install(pkg):
     subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
@@ -42,12 +41,6 @@ GLIBC_DIR    = os.path.join(HOME_DIR, "glibc-compat")
 PATCHELF     = os.path.join(HOME_DIR, "patchelf")
 PATCHED_FLAG = os.path.join(HOME_DIR, ".glibc_patched")
 EXTRACT_FLAG = os.path.join(HOME_DIR, ".bins_extracted")
-PLAYIT_BIN   = os.path.join(HOME_DIR, "playit")
-PLAYIT_LOG   = os.path.join(HOME_DIR, "playit.log")
-PLAYIT_URL   = "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64"
-
-# Regex qui matche UNIQUEMENT https://playit.gg/claim/ suivi d'un token hex/alphanum
-CLAIM_RE = re.compile(r'https://playit\.gg/claim/[A-Za-z0-9_-]+')
 
 DFS_TARBALL_URL = "https://github.com/DarkflameUniverse/DarkflameServer/archive/refs/heads/main.tar.gz"
 
@@ -70,18 +63,6 @@ GLIBC_DEBS = [
     f"{SEC}/g/gcc-14/libgcc-s1_14.2.0-4ubuntu2~24.04.1_amd64.deb",
 ]
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
-
-ANSI_ESCAPE = re.compile(
-    rb'(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]'
-    rb'|\x1B[\x20-\x2F]*[\x30-\x7E]'
-    rb'|[\x1B\x9B][()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><~]'
-    rb'|\x1b\[\?[0-9]+[hl]'
-    rb'|\x1b\[[0-9;]*m'
-    rb'|\r'
-)
-
-def strip_ansi_bytes(data: bytes) -> bytes:
-    return ANSI_ESCAPE.sub(b'', data)
 
 
 def load_config():
@@ -631,103 +612,6 @@ def check_client_files(cfg):
     print(f"[✓] Fichiers client OK à {client_path}")
 
 
-def start_playit():
-    """
-    Lance playit, redirige stdout+stderr vers playit.log.
-    Poll playit.log uniquement pour trouver le claim URL via regex stricte.
-    Le claim URL ressemble à : https://playit.gg/claim/XXXXXXXXXXXXXXXX
-    """
-    print("\n[=] Démarrage de playit.gg...")
-
-    if not os.path.isfile(PLAYIT_BIN):
-        print("[=] Téléchargement de playit-linux-amd64...")
-        try:
-            download_file(PLAYIT_URL, PLAYIT_BIN)
-            os.chmod(PLAYIT_BIN, 0o755)
-            print("[✓] playit téléchargé.")
-        except Exception as e:
-            print(f"[!] Impossible de télécharger playit : {e}")
-            return
-
-    env = os.environ.copy()
-    playit_secret = os.environ.get("PLAYIT_SECRET", "")
-
-    # Efface le log précédent
-    try:
-        os.remove(PLAYIT_LOG)
-    except FileNotFoundError:
-        pass
-
-    if playit_secret:
-        env["PLAYIT_SECRET"] = playit_secret
-        print("[=] PLAYIT_SECRET défini → lancement daemon direct.")
-        with open(PLAYIT_LOG, "w") as lf:
-            subprocess.Popen(
-                [PLAYIT_BIN], env=env,
-                stdout=lf, stderr=subprocess.STDOUT,
-                close_fds=True,
-            )
-        print("[✓] playit daemon actif.")
-        time.sleep(3)
-        return
-
-    print("[!] PLAYIT_SECRET non défini — attente du claim code...")
-    print(f"[=] Lancement playit, poll de {PLAYIT_LOG} (30s)...")
-
-    with open(PLAYIT_LOG, "w") as lf:
-        subprocess.Popen(
-            [PLAYIT_BIN], env=env,
-            stdout=lf, stderr=subprocess.STDOUT,
-            close_fds=True,
-        )
-
-    claim_url = None
-    for i in range(30):
-        time.sleep(1)
-        try:
-            with open(PLAYIT_LOG, 'rb') as f:
-                raw = f.read()
-            clean = strip_ansi_bytes(raw).decode('utf-8', errors='replace')
-            # Cherche UNIQUEMENT les URLs avec un token d'au moins 8 caractères
-            matches = CLAIM_RE.findall(clean)
-            for m in matches:
-                token = m.split('/claim/')[-1]
-                # Le token doit avoir au moins 8 chars pour éviter les faux positifs
-                if len(token) >= 8:
-                    claim_url = m
-                    break
-        except Exception:
-            pass
-
-        if claim_url:
-            break
-        if (i + 1) % 5 == 0:
-            print(f"[=] Attente claim... {i+1}s")
-
-    if claim_url:
-        print(f"")
-        print(f"[>>>] ==========================================")
-        print(f"[>>>]  CLAIM CODE PLAYIT :")
-        print(f"[>>>]  {claim_url}")
-        print(f"[>>>]  Ouvrez ce lien pour lier votre compte.")
-        print(f"[>>>] ==========================================")
-        print(f"")
-    else:
-        print("[!] Claim code non trouvé après 30s.")
-        print("[=] Contenu de playit.log :")
-        try:
-            with open(PLAYIT_LOG, 'rb') as f:
-                raw = f.read()
-            clean = strip_ansi_bytes(raw).decode('utf-8', errors='replace')
-            for line in clean.splitlines():
-                if line.strip():
-                    print(f"  {line}")
-        except Exception as e:
-            print(f"  [erreur: {e}]")
-
-    print("[✓] playit actif en arrière-plan.")
-
-
 def start_server():
     print("\n[=] Démarrage de Darkflame Universe...")
     master = find_binary("master")
@@ -760,7 +644,6 @@ def main():
     test_db_connection(cfg)
     write_config(cfg)
     setup_server_data(cfg)
-    start_playit()
     start_server()
 
 
