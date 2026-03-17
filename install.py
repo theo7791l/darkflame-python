@@ -616,16 +616,11 @@ def check_client_files(cfg):
 
 def start_playit():
     """
-    Lance playit.gg en arrière-plan si PLAYIT_SECRET est défini dans les variables d'env.
-    PLAYIT_SECRET = clé secrète du tunnel playit (depuis le dashboard playit.gg).
-    Si PLAYIT_SECRET n'est pas défini, playit affichera un claim code dans les logs
-    pour lier l'agent à votre compte.
+    Lance playit.gg en arrière-plan automatiquement.
+    Si PLAYIT_SECRET est défini en variable d'env, il est utilisé directement.
+    Sinon, playit affiche un claim code dans playit.log pour lier le compte.
     """
-    use_playit = os.environ.get("USE_PLAYIT", "").lower() in ("1", "true", "yes")
-    if not use_playit:
-        return
-
-    print("\n[=] Playit.gg activé (USE_PLAYIT=1)...")
+    print("\n[=] Démarrage de playit.gg (tunnel port Auth)...")
 
     if not os.path.isfile(PLAYIT_BIN):
         print("[=] Téléchargement de playit-linux-amd64...")
@@ -635,17 +630,16 @@ def start_playit():
             print("[✓] playit téléchargé.")
         except Exception as e:
             print(f"[!] Impossible de télécharger playit : {e}")
+            print("[!] Continuer sans playit...")
             return
 
-    playit_secret = os.environ.get("PLAYIT_SECRET", "")
     env = os.environ.copy()
-
+    playit_secret = os.environ.get("PLAYIT_SECRET", "")
     if playit_secret:
         env["PLAYIT_SECRET"] = playit_secret
         print("[=] Lancement playit avec secret configuré...")
     else:
-        print("[!] PLAYIT_SECRET non défini — playit va afficher un claim code dans les logs.")
-        print("[!] Copiez ce code sur https://playit.gg pour lier l'agent à votre compte.")
+        print("[!] PLAYIT_SECRET non défini — lisez playit.log pour le claim code.")
 
     log_path = os.path.join(HOME_DIR, "playit.log")
     with open(log_path, "w") as log_file:
@@ -659,14 +653,15 @@ def start_playit():
     print("[=] Attente 5s pour que le tunnel s'établisse...")
     time.sleep(5)
 
-    # Affiche les premières lignes de log pour voir le claim code si besoin
     try:
         with open(log_path, "r") as lf:
             lines = lf.readlines()
             if lines:
-                print("[=] Logs playit (début) :")
-                for line in lines[:20]:
+                print("[=] Logs playit :")
+                for line in lines[:25]:
                     print(f"    {line.rstrip()}")
+            else:
+                print("[!] playit.log vide — playit n'a peut-être pas démarré correctement.")
     except Exception:
         pass
 
