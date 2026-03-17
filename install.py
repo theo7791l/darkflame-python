@@ -5,6 +5,7 @@ pour container Python Pterodactyl avec DB externe
 """
 
 import os
+import re
 import subprocess
 import sys
 import shutil
@@ -65,6 +66,11 @@ GLIBC_DEBS = [
     f"{SEC}/g/gcc-14/libgcc-s1_14.2.0-4ubuntu2~24.04.1_amd64.deb",
 ]
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
+
+ANSI_ESCAPE = re.compile(r'(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]|\x1B[\x20-\x2F]*[\x30-\x7E]|[\x1B\x9B][()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><~]|\x1b\[\?[0-9]+[hl]|\x1b\[[0-9;]*m')
+
+def strip_ansi(text):
+    return ANSI_ESCAPE.sub('', text)
 
 
 def load_config():
@@ -617,10 +623,11 @@ def check_client_files(cfg):
 def start_playit():
     """
     Lance playit.gg en arrière-plan automatiquement.
+    NO_COLOR=1 + TERM=dumb désactivent la TUI pour un output texte lisible.
     Si PLAYIT_SECRET est défini en variable d'env, il est utilisé directement.
-    Sinon, playit affiche un claim code dans playit.log pour lier le compte.
+    Sinon, le claim code apparaît dans les logs du panel et dans playit.log.
     """
-    print("\n[=] Démarrage de playit.gg (tunnel port Auth)...")
+    print("\n[=] Démarrage de playit.gg...")
 
     if not os.path.isfile(PLAYIT_BIN):
         print("[=] Téléchargement de playit-linux-amd64...")
@@ -634,12 +641,17 @@ def start_playit():
             return
 
     env = os.environ.copy()
+    # Désactive la TUI interactive pour avoir un output texte propre
+    env["NO_COLOR"]  = "1"
+    env["TERM"]      = "dumb"
+    env["CLICOLOR"]  = "0"
+
     playit_secret = os.environ.get("PLAYIT_SECRET", "")
     if playit_secret:
         env["PLAYIT_SECRET"] = playit_secret
         print("[=] Lancement playit avec secret configuré...")
     else:
-        print("[!] PLAYIT_SECRET non défini — lisez playit.log pour le claim code.")
+        print("[!] PLAYIT_SECRET non défini — un claim code va apparaître ci-dessous.")
 
     log_path = os.path.join(HOME_DIR, "playit.log")
     with open(log_path, "w") as log_file:
@@ -649,21 +661,27 @@ def start_playit():
             stdout=log_file,
             stderr=subprocess.STDOUT
         )
-    print(f"[✓] playit lancé en arrière-plan (PID {proc.pid}), logs → {log_path}")
-    print("[=] Attente 5s pour que le tunnel s'établisse...")
-    time.sleep(5)
+    print(f"[✓] playit lancé (PID {proc.pid}), attente 8s...")
+    time.sleep(8)
 
     try:
-        with open(log_path, "r") as lf:
-            lines = lf.readlines()
-            if lines:
-                print("[=] Logs playit :")
-                for line in lines[:25]:
-                    print(f"    {line.rstrip()}")
-            else:
-                print("[!] playit.log vide — playit n'a peut-être pas démarré correctement.")
-    except Exception:
-        pass
+        with open(log_path, "rb") as lf:
+            raw = lf.read().decode("utf-8", errors="replace")
+        clean = strip_ansi(raw)
+        lines = [l for l in clean.splitlines() if l.strip()]
+        if lines:
+            print("[=] ===== PLAYIT LOGS =====")
+            for line in lines[:30]:
+                print(f"    {line}")
+            print("[=] ======================")
+            # Cherche et met en avant le claim code
+            for line in lines:
+                if "playit.gg/claim" in line or "claim" in line.lower():
+                    print(f"[>>>] CLAIM CODE : {line.strip()}")
+        else:
+            print("[!] playit.log vide après 8s.")
+    except Exception as e:
+        print(f"[!] Erreur lecture playit.log : {e}")
 
 
 def start_server():
