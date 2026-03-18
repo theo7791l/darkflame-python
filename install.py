@@ -78,98 +78,184 @@ GLIBC_DEBS = [
 ]
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
-# Ports disponibles : 4 ports publics seulement
-# Auth=25749, Master=25651, Chat=25690, World=25631 (proxy UDP)
 DEFAULT_AUTH_PORT   = "25749"
 DEFAULT_MASTER_PORT = "25651"
 DEFAULT_CHAT_PORT   = "25690"
 DEFAULT_WORLD_PORT  = "25631"
 
-# Ports internes des WorldServers (jamais exposés publiquement)
-# Le proxy UDP écoute sur DEFAULT_WORLD_PORT et route vers ces ports internes
-WORLD_PORT_START_INTERNAL = 3000   # premier port interne world
-WORLD_PORT_RANGE          = 300    # on réserve 3000-3299 en interne
+WORLD_PORT_START_INTERNAL = 3000
+WORLD_PORT_RANGE          = 50
 
 
 # ---------------------------------------------------------------------------
-# UDP Proxy - route le port public unique vers tous les WorldServers internes
+# Proxy UDP avec réécriture des paquets de transfert de zone
 # ---------------------------------------------------------------------------
+# Darkflame envoie au client un paquet "redirect vers WorldServer" contenant
+# l'IP+port INTERNE (ex: 127.0.0.1:3003). On intercepte ce paquet depuis le
+# WorldServer (ou MasterServer via AuthServer) et on remplace l'IP interne
+# et le port interne par l'IP publique + port public du proxy.
+#
+# Format du paquet DFU de redirection (ID 0x0E = 14 = MSG_SERVER_REDIRECT) :
+#   [RakNet header variable] [packet_id=0x53] [... ] [remote_conn_type=0x04]
+#   [ip_len:u8] [ip:ascii] [port:u16_LE] [...]
+#
+# On utilise une approche plus robuste : on cherche dans le payload brut
+# la séquence IP interne encodée (ex: "127.0.0.1" ou "0.0.0.0") et on
+# remplace l'IP + le port qui suit.
+# ---------------------------------------------------------------------------
+
+def _ip_to_bytes(ip: str) -> bytes:
+    """Encode une IP comme dans les paquets DFU : u8(len) + ascii."""
+    b = ip.encode('ascii')
+    return bytes([len(b)]) + b
+
+
+def patch_world_redirect(data: bytes,
+                         internal_ports: set,
+                         public_ip: str,
+                         public_port: int) -> bytes:
+    """
+    Cherche dans `data` un motif : [u8 len][IP ascii][u16_LE port]
+    où port est dans internal_ports.
+    Remplace l'IP par public_ip et le port par public_port.
+    Peut matcher plusieurs fois (rare mais possible).
+    """
+    result = bytearray(data)
+    i = 0
+    patched = False
+    while i < len(result) - 3:
+        ip_len = result[i]
+        if 7 <= ip_len <= 15:  # longueur valide pour une IPv4
+            end_ip = i + 1 + ip_len
+            if end_ip + 2 <= len(result):
+                try:
+                    candidate_ip = result[i+1:end_ip].decode('ascii')
+                except Exception:
+                    i += 1
+                    continue
+                # Vérifier que c'est une IPv4 valide
+                parts = candidate_ip.split('.')
+                if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+                    port_bytes = result[end_ip:end_ip+2]
+                    port_val = struct.unpack_from('<H', bytes(port_bytes))[0]
+                    if port_val in internal_ports:
+                        print(f"[proxy] Patch redirect: {candidate_ip}:{port_val} → {public_ip}:{public_port}")
+                        new_ip_b   = public_ip.encode('ascii')
+                        new_prefix = bytes([len(new_ip_b)]) + new_ip_b
+                        new_port_b = struct.pack('<H', public_port)
+                        result = (
+                            result[:i]
+                            + bytearray(new_prefix)
+                            + bytearray(new_port_b)
+                            + result[end_ip+2:]
+                        )
+                        patched = True
+                        i += len(new_prefix) + 2
+                        continue
+        i += 1
+    return bytes(result)
+
 
 class UDPProxy:
     """
-    Écoute sur le port public (ex: 25631) et route les paquets
-    vers le bon WorldServer interne selon l'adresse source du client.
+    Proxy UDP bidirectionnel avec réécriture des paquets de transfert de zone.
 
-    Mapping client → backend :
-      - Premier paquet d'un nouveau client : on essaie chaque backend
-        dans l'ordre jusqu'à trouver celui qui répond (round-robin).
-      - Ensuite on garde la session client ↔ backend.
+    - Client → Proxy (port public) → WorldServer interne
+    - WorldServer interne → Proxy → Client
+      (avec patch des paquets redirect pour remplacer IP:port interne par IP:port public)
+
+    Routing : premier paquet d'un client inconnu → on cherche quel backend
+    est actif (en écoute UDP). On mémorise la session client↔backend.
     """
 
-    SESSION_TIMEOUT = 120  # secondes sans activité avant suppression de session
+    SESSION_TIMEOUT = 120
 
-    def __init__(self, public_port: int, internal_ports: list):
+    def __init__(self, public_port: int, internal_ports: list,
+                 public_ip: str = ""):
         self.public_port    = public_port
-        self.internal_ports = internal_ports
-        self.sessions       = {}          # client_addr → backend_addr
-        self.backend_socks  = {}          # backend_addr → socket UDP vers ce backend
+        self.internal_ports = list(internal_ports)
+        self.internal_set   = set(internal_ports)
+        self.public_ip      = public_ip
+        self.sessions       = {}   # client_addr → ("127.0.0.1", port)
+        self.backend_socks  = {}   # ("127.0.0.1", port) → socket UDP
         self.lock           = threading.Lock()
-        self.last_seen      = {}          # client_addr → timestamp
+        self.last_seen      = {}   # client_addr → timestamp
         self.sock           = None
+        # round-robin index pour nouveaux clients
+        self._rr_idx        = 0
 
-    def _get_or_create_backend_sock(self, backend_addr):
-        if backend_addr not in self.backend_socks:
+    # ------------------------------------------------------------------
+    def _backend_sock(self, addr):
+        if addr not in self.backend_socks:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0.5)
-            self.backend_socks[backend_addr] = s
-        return self.backend_socks[backend_addr]
+            self.backend_socks[addr] = s
+        return self.backend_socks[addr]
 
-    def _pick_backend(self, data, client_addr):
+    def _is_port_open(self, port: int) -> bool:
+        """Vérifie si un port UDP local est en écoute via /proc/net/udp."""
+        try:
+            with open('/proc/net/udp') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    local = parts[1]
+                    hex_port = local.split(':')[1]
+                    if int(hex_port, 16) == port:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _active_backends(self) -> list:
+        """Retourne les ports internes actuellement en écoute."""
+        return [p for p in self.internal_ports if self._is_port_open(p)]
+
+    def _pick_backend(self) -> tuple:
         """
         Choisit le backend pour un nouveau client.
-        On tente une connexion rapide sur chaque port interne connu,
-        on prend celui qui est en écoute (SO_REUSEADDR + envoi sonde).
-        En fallback, on distribue en round-robin.
+        Priorité aux ports actifs selon /proc/net/udp.
         """
-        for port in self.internal_ports:
-            backend = ("127.0.0.1", port)
-            try:
-                probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                probe.settimeout(0.05)
-                probe.sendto(data, backend)
-                probe.recvfrom(4096)
-                probe.close()
-                return backend
-            except Exception:
-                try:
-                    probe.close()
-                except Exception:
-                    pass
-        # fallback : round-robin basique
-        idx = len(self.sessions) % len(self.internal_ports)
-        return ("127.0.0.1", self.internal_ports[idx])
+        active = self._active_backends()
+        if active:
+            with self.lock:
+                idx = self._rr_idx % len(active)
+                self._rr_idx += 1
+            return ("127.0.0.1", active[idx])
+        # fallback : port de base
+        return ("127.0.0.1", self.internal_ports[0])
 
-    def _backend_to_client(self, backend_addr, pub_sock):
-        """Thread : reçoit les réponses du backend et les renvoie au bon client."""
-        bsock = self._get_or_create_backend_sock(backend_addr)
+    # ------------------------------------------------------------------
+    def _backend_reader(self, port: int):
+        """Thread par backend : reçoit les paquets du WorldServer et les renvoie au client."""
+        addr  = ("127.0.0.1", port)
+        bsock = self._backend_sock(addr)
+        pub   = self.sock
         while True:
             try:
                 data, _ = bsock.recvfrom(65535)
-                # retrouver le client associé à ce backend
-                with self.lock:
-                    clients = [c for c, b in self.sessions.items() if b == backend_addr]
-                for client_addr in clients:
-                    try:
-                        pub_sock.sendto(data, client_addr)
-                    except Exception:
-                        pass
             except socket.timeout:
                 continue
             except Exception:
                 break
 
+            # Patcher les redirections de zone avant d'envoyer au client
+            if self.public_ip and self.internal_set:
+                data = patch_world_redirect(
+                    data, self.internal_set,
+                    self.public_ip, self.public_port
+                )
+
+            with self.lock:
+                clients = [c for c, b in self.sessions.items() if b == addr]
+            for client_addr in clients:
+                try:
+                    pub.sendto(data, client_addr)
+                except Exception:
+                    pass
+
     def _cleanup_loop(self):
-        """Supprime les sessions inactives."""
         while True:
             time.sleep(30)
             now = time.time()
@@ -180,33 +266,28 @@ class UDPProxy:
                     self.sessions.pop(c, None)
                     self.last_seen.pop(c, None)
             if dead:
-                print(f"[proxy] {len(dead)} session(s) expirée(s) supprimées.")
+                print(f"[proxy] {len(dead)} session(s) expirée(s).")
 
+    # ------------------------------------------------------------------
     def start(self):
         if not self.internal_ports:
-            print("[proxy] Aucun port interne world détecté, proxy désactivé.")
+            print("[proxy] Aucun port interne, proxy désactivé.")
             return
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", self.public_port))
         print(f"[proxy] UDP proxy démarré sur 0.0.0.0:{self.public_port}")
-        print(f"[proxy] Backends internes : {self.internal_ports}")
+        print(f"[proxy] Rewrite: interne {self.internal_ports[0]}..{self.internal_ports[-1]} → {self.public_ip}:{self.public_port}")
 
-        # démarrer les threads de réponse backend → client
         for port in self.internal_ports:
-            backend_addr = ("127.0.0.1", port)
-            bsock = self._get_or_create_backend_sock(backend_addr)
             t = threading.Thread(
-                target=self._backend_to_client,
-                args=(backend_addr, self.sock),
-                daemon=True
-            )
+                target=self._backend_reader, args=(port,), daemon=True)
             t.start()
 
         threading.Thread(target=self._cleanup_loop, daemon=True).start()
 
-        # boucle principale : client → backend
+        # Boucle principale : client → backend
         while True:
             try:
                 data, client_addr = self.sock.recvfrom(65535)
@@ -216,34 +297,24 @@ class UDPProxy:
             with self.lock:
                 self.last_seen[client_addr] = time.time()
                 if client_addr not in self.sessions:
-                    backend = self._pick_backend(data, client_addr)
+                    backend = self._pick_backend()
                     self.sessions[client_addr] = backend
                     print(f"[proxy] Nouvelle session {client_addr} → {backend}")
                 backend = self.sessions[client_addr]
 
             try:
-                bsock = self._get_or_create_backend_sock(backend)
-                bsock.sendto(data, backend)
+                self._backend_sock(backend).sendto(data, backend)
             except Exception as e:
-                print(f"[proxy] Erreur envoi vers {backend}: {e}")
+                print(f"[proxy] Erreur envoi {backend}: {e}")
 
 
-def discover_world_ports(world_port_start: int, count: int = 50) -> list:
-    """
-    Retourne la liste des ports internes sur lesquels un WorldServer
-    est probablement en écoute UDP (world_port_start .. world_port_start+count).
-    On les inclut tous : le proxy testera lequel répond vraiment.
-    """
-    return list(range(world_port_start, world_port_start + count))
-
-
-def start_udp_proxy(public_world_port: int, internal_wps: int):
+def start_udp_proxy(public_world_port: int, internal_wps: int, public_ip: str):
     """Lance le proxy UDP dans un thread daemon."""
-    ports = discover_world_ports(internal_wps, count=50)
-    proxy = UDPProxy(public_world_port, ports)
+    ports = list(range(internal_wps, internal_wps + WORLD_PORT_RANGE))
+    proxy = UDPProxy(public_world_port, ports, public_ip=public_ip)
     t = threading.Thread(target=proxy.start, daemon=True)
     t.start()
-    print(f"[proxy] Thread proxy démarré (port public {public_world_port} → interne {internal_wps}..{internal_wps+49})")
+    print(f"[proxy] Thread démarré (public {public_world_port} → interne {internal_wps}..{internal_wps+WORLD_PORT_RANGE-1})")
     return proxy
 
 
@@ -920,8 +991,6 @@ def write_config(cfg):
     chat_port    = _cfg_get(cfg, "Networking", "chat_server_port",   DEFAULT_CHAT_PORT)
     master_port  = _cfg_get(cfg, "Networking", "master_server_port", DEFAULT_MASTER_PORT)
 
-    # Les WorldServers internes utilisent WORLD_PORT_START_INTERNAL (3000+)
-    # Le proxy UDP écoute sur world_port public (25631) et route vers ces ports internes
     internal_wps = str(WORLD_PORT_START_INTERNAL)
 
     max_offline_time       = _cfg_get(cfg, "Gameplay", "max_offline_time",       "0")
@@ -973,9 +1042,6 @@ def write_config(cfg):
         f"\n"
     )
 
-    # external_ip = IP publique pour que le client sache où se reconnecter
-    # world_port_start = port interne (3000) → les WorldServers s'y lient en localhost
-    # Le proxy UDP fait le pont entre le port public 25631 et ces ports internes
     networking_base = (
         f"external_ip={external_ip}\n"
         f"listening_ip=0.0.0.0\n"
@@ -999,7 +1065,7 @@ def write_config(cfg):
             f.write(content)
 
     print("[✓] Configs écrites (authconfig, masterconfig, worldconfig, chatconfig).")
-    return int(world_port), int(internal_wps)
+    return int(world_port), int(internal_wps), external_ip
 
 
 def check_client_files(cfg):
@@ -1016,7 +1082,7 @@ def check_client_files(cfg):
     print(f"[✓] Fichiers client OK à {client_path}")
 
 
-def start_server(public_world_port: int, internal_wps: int):
+def start_server(public_world_port: int, internal_wps: int, public_ip: str):
     print("\n[=] Démarrage de Darkflame Universe...")
     master = find_binary("master")
     if master is None:
@@ -1027,10 +1093,9 @@ def start_server(public_world_port: int, internal_wps: int):
     if os.path.isdir(GLIBC_DIR):
         setup_ld_library_path()
 
-    # Démarrer le proxy UDP avant le MasterServer
-    print("\n[=] Démarrage du proxy UDP world...")
-    start_udp_proxy(public_world_port, internal_wps)
-    time.sleep(1)  # laisser le proxy démarrer
+    print("\n[=] Démarrage du proxy UDP world (avec rewrite IP:port)...")
+    start_udp_proxy(public_world_port, internal_wps, public_ip)
+    time.sleep(1)
 
     print(f"[✓] Lancement de {master}")
     os.chdir(BUILD_DIR)
@@ -1060,10 +1125,10 @@ def main():
         build_server()
     check_client_files(cfg)
     test_db_connection(cfg)
-    public_world_port, internal_wps = write_config(cfg)
+    public_world_port, internal_wps, public_ip = write_config(cfg)
     setup_server_data(cfg)
     setup_first_account(cfg)
-    start_server(public_world_port, internal_wps)
+    start_server(public_world_port, internal_wps, public_ip)
 
 
 if __name__ == "__main__":
