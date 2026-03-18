@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-Darkflame Universe - Script d'installation et de démarrage
-pour container Python Pterodactyl avec DB externe
+Darkflame Universe - Pterodactyl Python Container
+
+Architecture des ports :
+  Auth   : binaire écoute directement sur 25749 (public)
+  Master : binaire écoute directement sur 25651 (public)
+  Chat   : binaire écoute directement sur 25690 (public)
+  World  : binaires écoutent sur 127.0.0.1:3000, 3001, 3002... (internes)
+           proxy UDP Python écoute sur 0.0.0.0:25631 (public)
+           le proxy patche les paquets de transfert de zone pour que le
+           client reçoive toujours 38.190.133.136:25631
 """
 
 import os
-import re
 import subprocess
 import sys
 import shutil
@@ -81,7 +88,189 @@ PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patch
 DEFAULT_AUTH_PORT   = "25749"
 DEFAULT_MASTER_PORT = "25651"
 DEFAULT_CHAT_PORT   = "25690"
-DEFAULT_WORLD_PORT  = "25631"
+DEFAULT_WORLD_PORT  = "25631"   # port public unique pour tous les worlds
+WORLD_PORT_INTERNAL_START = 3000  # les binaires world écoutent ici
+WORLD_PORT_RANGE          = 50    # 3000..3049
+
+
+# ---------------------------------------------------------------------------
+# Proxy UDP World
+# ---------------------------------------------------------------------------
+# DFU alloue world_port_start, world_port_start+1, world_port_start+2...
+# pour chaque WorldServer. Ces ports écoutent sur localhost (inaccessibles).
+# Le proxy :
+#   - écoute sur 0.0.0.0:25631
+#   - maintient une table session client -> backend interne
+#   - quand le MasterServer envoie un paquet "redirect vers port interne X",
+#     le proxy patche ce paquet pour mettre 38.190.133.136:25631 à la place
+# ---------------------------------------------------------------------------
+
+def patch_world_redirect(data: bytes, internal_ports: set,
+                         public_ip: str, public_port: int) -> bytes:
+    """
+    Cherche le motif [u8 ip_len][IPv4 ascii][u16_LE port] dans data.
+    Si port est un port interne world, remplace par public_ip:public_port.
+    """
+    result = bytearray(data)
+    i = 0
+    patched = False
+    while i < len(result) - 3:
+        ip_len = result[i]
+        if 7 <= ip_len <= 15:
+            end_ip = i + 1 + ip_len
+            if end_ip + 2 <= len(result):
+                try:
+                    candidate_ip = result[i+1:end_ip].decode('ascii')
+                except Exception:
+                    i += 1
+                    continue
+                parts = candidate_ip.split('.')
+                if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+                    port_val = struct.unpack_from('<H', bytes(result[end_ip:end_ip+2]))[0]
+                    if port_val in internal_ports:
+                        new_ip_b = public_ip.encode('ascii')
+                        replacement = bytes([len(new_ip_b)]) + new_ip_b + struct.pack('<H', public_port)
+                        result = result[:i] + bytearray(replacement) + result[end_ip+2:]
+                        i += len(replacement)
+                        patched = True
+                        continue
+        i += 1
+    if patched:
+        print(f"[proxy-world] Patch redirect → {public_ip}:{public_port}")
+    return bytes(result)
+
+
+class WorldProxy:
+    """Proxy UDP : public 25631 <-> internes 3000..3049.
+    
+    Table de sessions : addr_client -> port_interne_world
+    Quand un nouveau client arrive, on cherche le WorldServer actif
+    (port ouvert sur localhost) avec le moins de sessions.
+    """
+    SESSION_TIMEOUT = 120
+
+    def __init__(self, public_port: int, internal_start: int,
+                 internal_range: int, public_ip: str):
+        self.public_port    = public_port
+        self.int_start      = internal_start
+        self.int_range      = internal_range
+        self.public_ip      = public_ip
+        self.internal_ports = set(range(internal_start, internal_start + internal_range))
+
+        self.sock      = None
+        self.sessions  = {}   # client_addr -> internal_port
+        self.last_seen = {}   # client_addr -> timestamp
+        self.bsocks    = {}   # internal_port -> UDP socket
+        self.lock      = threading.Lock()
+
+    def _get_active_ports(self):
+        """Retourne les ports internes avec un WorldServer actif (via /proc/net/udp)."""
+        active = set()
+        try:
+            with open('/proc/net/udp') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        p = int(parts[1].split(':')[1], 16)
+                        if p in self.internal_ports:
+                            active.add(p)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return active
+
+    def _pick_backend(self):
+        """Choisit le port interne actif avec le moins de sessions."""
+        active = self._get_active_ports()
+        if not active:
+            return self.int_start  # fallback
+        with self.lock:
+            load = {p: sum(1 for v in self.sessions.values() if v == p) for p in active}
+        return min(load, key=load.get)
+
+    def _backend_sock(self, port):
+        if port not in self.bsocks:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            self.bsocks[port] = s
+        return self.bsocks[port]
+
+    def _backend_reader(self, port):
+        """Thread : reçoit les paquets d'un WorldServer interne et les renvoie au client."""
+        bsock = self._backend_sock(port)
+        while True:
+            try:
+                data, _ = bsock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            # Patche les paquets de redirection de zone
+            data = patch_world_redirect(
+                data, self.internal_ports, self.public_ip, self.public_port
+            )
+
+            with self.lock:
+                clients = [c for c, p in self.sessions.items() if p == port]
+            for addr in clients:
+                try:
+                    self.sock.sendto(data, addr)
+                except Exception:
+                    pass
+
+    def _cleanup_loop(self):
+        while True:
+            time.sleep(30)
+            now = time.time()
+            with self.lock:
+                dead = [c for c, t in self.last_seen.items()
+                        if now - t > self.SESSION_TIMEOUT]
+                for c in dead:
+                    self.sessions.pop(c, None)
+                    self.last_seen.pop(c, None)
+
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", self.public_port))
+        print(f"[proxy-world] Écoute 0.0.0.0:{self.public_port} → internes {self.int_start}..{self.int_start+self.int_range-1}")
+
+        for port in range(self.int_start, self.int_start + self.int_range):
+            threading.Thread(target=self._backend_reader, args=(port,), daemon=True).start()
+
+        threading.Thread(target=self._cleanup_loop, daemon=True).start()
+
+        while True:
+            try:
+                data, client_addr = self.sock.recvfrom(65535)
+            except Exception:
+                continue
+
+            with self.lock:
+                self.last_seen[client_addr] = time.time()
+                if client_addr not in self.sessions:
+                    backend = self._pick_backend()
+                    self.sessions[client_addr] = backend
+                    print(f"[proxy-world] Nouvelle session {client_addr} → :{backend}")
+                backend = self.sessions[client_addr]
+
+            try:
+                self._backend_sock(backend).sendto(data, ("127.0.0.1", backend))
+            except Exception as e:
+                print(f"[proxy-world] Erreur envoi :{backend}: {e}")
+
+
+def start_world_proxy(public_port: int, public_ip: str):
+    proxy = WorldProxy(public_port, WORLD_PORT_INTERNAL_START,
+                       WORLD_PORT_RANGE, public_ip)
+    t = threading.Thread(target=proxy.start, daemon=True)
+    t.start()
+    print(f"[proxy-world] Démarré : public {public_port} → internes {WORLD_PORT_INTERNAL_START}..{WORLD_PORT_INTERNAL_START+WORLD_PORT_RANGE-1}")
+    return proxy
 
 
 # ---------------------------------------------------------------------------
@@ -154,10 +343,6 @@ def create_account(cfg, username: str, password: str, gm_level: int = 9, with_pl
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Création du premier compte admin
-# ---------------------------------------------------------------------------
-
 def setup_first_account(cfg):
     admin_user = os.environ.get("ADMIN_USERNAME", "").strip()
     admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
@@ -170,8 +355,7 @@ def setup_first_account(cfg):
     tables_ok = db_tables_ready(cfg)
 
     if not tables_ok:
-        print("[=] Tables DB absentes (première migration) → MasterServer va les créer.")
-        print(f"[=] Compte '{admin_user}' sera créé automatiquement au prochain démarrage.")
+        print("[=] Tables DB absentes → MasterServer va les créer.")
         with open(PENDING_ACCOUNT_FLAG, 'w') as f:
             f.write(f"{admin_user}\n{admin_pass}\n9\n")
         return
@@ -206,21 +390,15 @@ def setup_first_account(cfg):
             pass
 
     create_account(cfg, username, password, gm_level=gm_level, with_play_key=True)
-    print("[✓] Compte admin prêt — vous pouvez vous connecter directement.")
+    print("[✓] Compte admin prêt.")
 
     if os.path.isfile(PENDING_ACCOUNT_FLAG):
         os.remove(PENDING_ACCOUNT_FLAG)
 
 
-# ---------------------------------------------------------------------------
-# Commande --add-account
-# ---------------------------------------------------------------------------
-
 def cmd_add_account(cfg, args):
     if len(args) < 2:
         print("Usage : python install.py --add-account <nom> <mdp> [--gm <niveau>]")
-        print("  --gm 0  = joueur normal (défaut)")
-        print("  --gm 9  = admin Mythran")
         sys.exit(1)
 
     username = args[0]
@@ -233,17 +411,13 @@ def cmd_add_account(cfg, args):
             try:
                 gm_level = int(args[idx + 1])
             except ValueError:
-                print("[!] Niveau GM invalide, utilisation de 0.")
+                pass
 
     if not db_tables_ready(cfg):
         print("[!] ERREUR : les tables DB n'existent pas encore.")
-        print("[!] Démarrez le serveur une fois pour jouer les migrations, puis réessayez.")
         sys.exit(1)
 
-    print(f"\n[=] Création du compte '{username}' (gm_level={gm_level})...")
-    success = create_account(cfg, username, password, gm_level=gm_level, with_play_key=True)
-    if success:
-        print(f"[✓] Compte '{username}' créé avec play key auto.")
+    create_account(cfg, username, password, gm_level=gm_level, with_play_key=True)
     sys.exit(0)
 
 
@@ -257,7 +431,7 @@ def refresh_config_template():
         shutil.copy2(repo_cfg, CONFIG_FILE)
         print(f"[✓] config_template.ini mis à jour depuis le repo.")
     elif not os.path.isfile(CONFIG_FILE):
-        print(f"[!] ERREUR : {CONFIG_FILE} introuvable et repo non disponible !")
+        print(f"[!] ERREUR : {CONFIG_FILE} introuvable !")
         sys.exit(1)
 
 
@@ -328,7 +502,6 @@ def needs_glibc_compat():
         return False
     r = subprocess.run(["ldd", master], capture_output=True, text=True)
     if r.returncode != 0:
-        print("[!] ldd a échoué → activation GLIBC compat par précaution")
         return True
     output = r.stdout + r.stderr
     return "GLIBC_2.38" in output or "GLIBC_2.39" in output or "not found" in output
@@ -347,9 +520,7 @@ def extract_so_from_tar(t, out_dir):
         base = os.path.basename(m.name)
         if not base:
             continue
-        is_so      = ".so" in base
-        is_ld_real = base.startswith("ld-") and base.endswith(".so")
-        if not (is_so or is_ld_real):
+        if ".so" not in base and not (base.startswith("ld-") and base.endswith(".so")):
             continue
         if not m.isfile():
             continue
@@ -362,7 +533,6 @@ def extract_so_from_tar(t, out_dir):
                 os.chmod(dest_path, 0o755)
         except Exception as e:
             print(f"  [!] Erreur extraction {base}: {e}")
-
     for m in members:
         base = os.path.basename(m.name)
         if not base or not m.issym():
@@ -372,9 +542,7 @@ def extract_so_from_tar(t, out_dir):
         dest_path   = os.path.join(out_dir, base)
         link_target = os.path.basename(m.linkname)
         target_path = os.path.join(out_dir, link_target)
-        if link_target == base:
-            continue
-        if not os.path.isfile(target_path):
+        if link_target == base or not os.path.isfile(target_path):
             continue
         try:
             if os.path.lexists(dest_path):
@@ -441,31 +609,25 @@ def find_ld(glibc_dir):
             p = os.path.join(glibc_dir, f)
             if os.path.isfile(p) and not os.path.islink(p):
                 os.chmod(p, 0o755)
-                print(f"[✓] ld réel trouvé : {f}")
                 return p
     for f in os.listdir(glibc_dir):
         if "ld-linux" in f:
             p = os.path.join(glibc_dir, f)
             if os.path.islink(p):
                 target_name = os.path.basename(os.readlink(p))
-                if target_name == f:
-                    continue
                 real = os.path.join(glibc_dir, target_name)
-                if os.path.isfile(real):
+                if target_name != f and os.path.isfile(real):
                     os.chmod(real, 0o755)
-                    print(f"[✓] ld via symlink : {f} -> {target_name}")
                     return p
             elif os.path.isfile(p):
                 os.chmod(p, 0o755)
-                print(f"[✓] ld-linux fichier direct : {f}")
                 return p
     for f in os.listdir(glibc_dir):
         if f.startswith("ld-"):
-            p = os.path.join(glibc_dir, f)
-            resolved = os.path.realpath(p)
-            if os.path.isfile(resolved):
-                os.chmod(resolved, 0o755)
-                return resolved
+            p = os.path.realpath(os.path.join(glibc_dir, f))
+            if os.path.isfile(p):
+                os.chmod(p, 0o755)
+                return p
     return None
 
 
@@ -489,8 +651,7 @@ def setup_glibc_compat():
                 print(f"[!] Erreur sur {url.split('/')[-1]}: {e}")
         shutil.rmtree(tmp, ignore_errors=True)
 
-    libs = os.listdir(GLIBC_DIR)
-    if not any('libc' in f for f in libs):
+    if not any('libc' in f for f in os.listdir(GLIBC_DIR)):
         print("[!] ERREUR : libc.so.6 non trouvé")
         sys.exit(1)
 
@@ -501,9 +662,8 @@ def setup_glibc_compat():
         with tarfile.open(tar) as t:
             for m in t.getmembers():
                 if m.name.endswith("patchelf") and m.isfile():
-                    src = t.extractfile(m)
                     with open(PATCHELF, 'wb') as out_f:
-                        shutil.copyfileobj(src, out_f)
+                        shutil.copyfileobj(t.extractfile(m), out_f)
                     break
         os.chmod(PATCHELF, 0o755)
         os.remove(tar)
@@ -512,7 +672,6 @@ def setup_glibc_compat():
     if ld is None:
         print(f"[!] ld-linux introuvable.")
         sys.exit(1)
-    print(f"[✓] ld-linux : {ld}")
 
     mariadb_lib = os.path.join(BUILD_DIR, "thirdparty", "mariadb-connector-cpp",
                                "src", "mariadb_connector_cpp-build")
@@ -523,8 +682,7 @@ def setup_glibc_compat():
         b = find_binary(key)
         if b:
             print(f"[=] Patch {os.path.basename(b)} → GLIBC compat...")
-            result = run(f"{PATCHELF} --set-interpreter {ld} --set-rpath {rpath} {b}", check=False)
-            if result.returncode == 0:
+            if run(f"{PATCHELF} --set-interpreter {ld} --set-rpath {rpath} {b}", check=False).returncode == 0:
                 patched_count += 1
 
     if patched_count > 0:
@@ -597,7 +755,7 @@ def fetch_repo_resources():
                           and any(f.endswith(".bin") for f in os.listdir(nav_dir)))
 
     if not missing_dirs and not need_navmeshes:
-        print("[✓] Tous les dossiers repo déjà présents (migrations, vanity, navmeshes), skip.")
+        print("[✓] Tous les dossiers repo déjà présents, skip.")
         return
 
     tar_path = os.path.join(HOME_DIR, "dfs-main.tar.gz")
@@ -605,10 +763,9 @@ def fetch_repo_resources():
     try:
         download_file(DFS_TARBALL_URL, tar_path)
     except Exception as e:
-        print(f"[!] Échec téléchargement tarball DarkflameServer : {e}")
+        print(f"[!] Échec téléchargement : {e}")
         sys.exit(1)
 
-    print("[=] Extraction depuis le tarball...")
     with tarfile.open(tar_path, 'r:gz') as t:
         members = t.getmembers()
         root_prefix = ""
@@ -619,10 +776,9 @@ def fetch_repo_resources():
                 break
 
         for src_name, dst_name in missing_dirs:
-            src_prefix = root_prefix + src_name + "/"
-            dest_dir   = os.path.join(BUILD_DIR, dst_name)
-            count = _extract_dir_from_tar(t, members, src_prefix, dest_dir)
-            print(f"[✓] {dst_name}/ : {count} fichier(s) extrait(s)")
+            count = _extract_dir_from_tar(t, members, root_prefix + src_name + "/",
+                                           os.path.join(BUILD_DIR, dst_name))
+            print(f"[✓] {dst_name}/ : {count} fichier(s)")
 
         if need_navmeshes:
             nav_zip_path = root_prefix + "resources/navmeshes.zip"
@@ -636,33 +792,27 @@ def fetch_repo_resources():
                         if fname.endswith(".bin"):
                             with z.open(name) as src, open(os.path.join(nav_dir, fname), 'wb') as out:
                                 shutil.copyfileobj(src, out)
-                bin_count = len([f for f in os.listdir(nav_dir) if f.endswith(".bin")])
-                print(f"[✓] navmeshes/ : {bin_count} fichier(s) .bin extrait(s)")
-            else:
-                print("[!] resources/navmeshes.zip introuvable dans le tarball")
+                print(f"[✓] navmeshes/ : {len([f for f in os.listdir(nav_dir) if f.endswith('.bin')])} .bin")
 
     os.remove(tar_path)
-    print("[✓] Ressources DarkflameServer OK.")
+    print("[✓] Ressources OK.")
 
 
 def setup_server_data(cfg):
     print("\n[=] Vérification des données serveur...")
     client_path = cfg.get("General", "client_location", fallback="/home/container/client")
 
-    client_copies = [
-        (os.path.join(client_path, "res"),    os.path.join(BUILD_DIR, "res")),
-        (os.path.join(client_path, "locale"), os.path.join(BUILD_DIR, "locale")),
-    ]
-    for src, dst in client_copies:
+    for sub in ["res", "locale"]:
+        src = os.path.join(client_path, sub)
+        dst = os.path.join(BUILD_DIR, sub)
         if os.path.isdir(src):
             if os.path.exists(dst):
-                print(f"[✓] {os.path.basename(dst)}/ déjà présent, skip.")
+                print(f"[✓] {sub}/ déjà présent, skip.")
             else:
-                print(f"[=] Copie {os.path.basename(src)}/ → {dst} ...")
+                print(f"[=] Copie {sub}/ ...")
                 shutil.copytree(src, dst)
-                print(f"[✓] {os.path.basename(src)}/ copié.")
         else:
-            print(f"[!] ERREUR : {src} introuvable dans le client !")
+            print(f"[!] ERREUR : {src} introuvable !")
             sys.exit(1)
 
     fetch_repo_resources()
@@ -738,16 +888,11 @@ def _cfg_get(cfg, section, option, fallback):
 
 def write_config(cfg):
     """
-    Écrit les fichiers .ini des 4 serveurs.
+    Écrit les fichiers .ini.
 
-    Tous les binaires écoutent directement sur leurs ports publics.
-    Aucun proxy n'est nécessaire.
-
-    Ports publics :
-      Auth   : 25749  (auth_server_port)
-      World  : 25631+ (world_port_start)
-      Chat   : 25690  (chat_server_port)
-      Master : 25651  (master_server_port)
+    Auth/Master/Chat : écoutent directement sur leurs ports publics.
+    World            : écoute sur world_port_start=3000 (interne, jamais exposé).
+                       Le proxy Python sur 25631 fait le relais + patch des paquets.
     """
     print("\n[=] Écriture de la configuration...")
     os.makedirs(BUILD_DIR, exist_ok=True)
@@ -764,7 +909,7 @@ def write_config(cfg):
 
     external_ip = _cfg_get(cfg, "Networking", "external_ip",        "0.0.0.0")
     auth_port   = _cfg_get(cfg, "Networking", "auth_server_port",   DEFAULT_AUTH_PORT)
-    world_port  = _cfg_get(cfg, "Networking", "world_server_port",  DEFAULT_WORLD_PORT)
+    world_port  = _cfg_get(cfg, "Networking", "world_server_port",  DEFAULT_WORLD_PORT)  # port public proxy
     chat_port   = _cfg_get(cfg, "Networking", "chat_server_port",   DEFAULT_CHAT_PORT)
     master_port = _cfg_get(cfg, "Networking", "master_server_port", DEFAULT_MASTER_PORT)
 
@@ -780,10 +925,11 @@ def write_config(cfg):
     log_to_file    = _cfg_get(cfg, "Logging", "log_to_file",    "0")
 
     print(f"[=] external_ip        = {external_ip}")
-    print(f"[=] auth_server_port   = {auth_port}")
-    print(f"[=] master_server_port = {master_port}")
-    print(f"[=] chat_server_port   = {chat_port}")
-    print(f"[=] world_port_start   = {world_port}  (les WorldServers écoutent sur {world_port}, {int(world_port)+1}, ...)")
+    print(f"[=] auth_server_port   = {auth_port} (public direct)")
+    print(f"[=] master_server_port = {master_port} (public direct)")
+    print(f"[=] chat_server_port   = {chat_port} (public direct)")
+    print(f"[=] world_server_port  = {world_port} (public via proxy)")
+    print(f"[=] world_port_start   = {WORLD_PORT_INTERNAL_START} (interne, proxy → {world_port})")
 
     if external_ip == "0.0.0.0":
         print("[!] ATTENTION : external_ip=0.0.0.0 — ajoutez EXTERNAL_IP dans Pterodactyl.")
@@ -794,53 +940,43 @@ def write_config(cfg):
         f"mysql_port={mysql_port}\n"
         f"mysql_database={mysql_db}\n"
         f"mysql_username={mysql_user}\n"
-        f"mysql_password={mysql_pass}\n"
-        f"\n"
+        f"mysql_password={mysql_pass}\n\n"
         f"[General]\n"
         f"client_location={client_loc}\n"
         f"use_custom_fdb={use_custom_fdb}\n"
-        f"fdb_path={fdb_path}\n"
-        f"\n"
+        f"fdb_path={fdb_path}\n\n"
         f"[Gameplay]\n"
         f"max_offline_time={max_offline_time}\n"
         f"kick_after_failed_auth={kick_after_failed_auth}\n"
         f"allow_mythran_commands={allow_mythran_commands}\n"
         f"disable_anti_cheat={disable_anti_cheat}\n"
         f"chatbot_enabled={chatbot_enabled}\n"
-        f"log_activity={log_activity}\n"
-        f"\n"
+        f"log_activity={log_activity}\n\n"
         f"[Logging]\n"
         f"log_level={log_level}\n"
         f"log_to_console={log_to_console}\n"
-        f"log_to_file={log_to_file}\n"
-        f"\n"
+        f"log_to_file={log_to_file}\n\n"
     )
 
-    # Tous les serveurs utilisent les mêmes ports publics directement
+    # Auth/Master/Chat voient world_server_port=25631 (port public du proxy)
+    # world_port_start=3000 (internes, utilisé par MasterServer pour allouer les WorldServers)
     networking = (
         f"[Networking]\n"
         f"external_ip={external_ip}\n"
         f"listening_ip=0.0.0.0\n"
         f"auth_server_port={auth_port}\n"
         f"world_server_port={world_port}\n"
-        f"world_port_start={world_port}\n"
+        f"world_port_start={WORLD_PORT_INTERNAL_START}\n"
         f"chat_server_port={chat_port}\n"
         f"master_server_port={master_port}\n"
     )
 
-    configs = {
-        "authconfig.ini":   common + networking,
-        "masterconfig.ini": common + networking,
-        "worldconfig.ini":  common + networking,
-        "chatconfig.ini":   common + networking,
-    }
-
-    for filename, content in configs.items():
-        dest = os.path.join(BUILD_DIR, filename)
-        with open(dest, "w") as f:
-            f.write(content)
+    for filename in ["authconfig.ini", "masterconfig.ini", "worldconfig.ini", "chatconfig.ini"]:
+        with open(os.path.join(BUILD_DIR, filename), "w") as f:
+            f.write(common + networking)
 
     print("[✓] Configs écrites.")
+    return int(world_port), external_ip
 
 
 def check_client_files(cfg):
@@ -849,15 +985,15 @@ def check_client_files(cfg):
     if not os.path.isdir(client_path):
         print(f"[!] ERREUR : client introuvable à {client_path}")
         sys.exit(1)
-    required = ["res/cdclient.fdb", "locale/locale.xml"]
-    missing = [f for f in required if not os.path.isfile(os.path.join(client_path, f))]
+    missing = [f for f in ["res/cdclient.fdb", "locale/locale.xml"]
+               if not os.path.isfile(os.path.join(client_path, f))]
     if missing:
         print(f"[!] Fichiers client manquants : {', '.join(missing)}")
         sys.exit(1)
     print(f"[✓] Fichiers client OK à {client_path}")
 
 
-def start_server():
+def start_server(public_world_port: int, public_ip: str):
     print("\n[=] Démarrage de Darkflame Universe...")
     master = find_binary("master")
     if master is None:
@@ -868,6 +1004,10 @@ def start_server():
     if os.path.isdir(GLIBC_DIR):
         setup_ld_library_path()
 
+    print("\n[=] Démarrage du proxy UDP World...")
+    start_world_proxy(public_world_port, public_ip)
+    time.sleep(0.5)
+
     print(f"[✓] Lancement de {master}")
     os.chdir(BUILD_DIR)
     os.execve(master, [master], os.environ)
@@ -876,10 +1016,9 @@ def start_server():
 def main():
     if "--add-account" in sys.argv:
         idx = sys.argv.index("--add-account")
-        extra_args = sys.argv[idx + 1:]
         cfg = load_config()
         test_db_connection(cfg)
-        cmd_add_account(cfg, extra_args)
+        cmd_add_account(cfg, sys.argv[idx + 1:])
         return
 
     print("===================================================")
@@ -896,10 +1035,10 @@ def main():
         build_server()
     check_client_files(cfg)
     test_db_connection(cfg)
-    write_config(cfg)
+    pub_world, public_ip = write_config(cfg)
     setup_server_data(cfg)
     setup_first_account(cfg)
-    start_server()
+    start_server(pub_world, public_ip)
 
 
 if __name__ == "__main__":
