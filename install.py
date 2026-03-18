@@ -74,14 +74,14 @@ GLIBC_DEBS = [
 ]
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
-# Ports ouverts : 25896 Auth, 25846 Master, 25784 Chat, 25740 World zone 1000
+# Ports ouverts : 25749 Auth, 25651 Master, 25690 Chat, 25631 World zone 1000
 # DFS formule : port = start + 1 + (instance_id * 3)
-# Zone 1000 instance 1 = 25736 + 1 + 3 = 25740
-DEFAULT_AUTH_PORT   = "25896"
-DEFAULT_MASTER_PORT = "25846"
-DEFAULT_CHAT_PORT   = "25784"
-DEFAULT_WORLD_PORT  = "25740"
-DEFAULT_WPS         = "25736"
+# Zone 1000 instance 1 = 25627 + 1 + 3 = 25631
+DEFAULT_AUTH_PORT   = "25749"
+DEFAULT_MASTER_PORT = "25651"
+DEFAULT_CHAT_PORT   = "25690"
+DEFAULT_WORLD_PORT  = "25631"
+DEFAULT_WPS         = "25627"
 
 
 # ---------------------------------------------------------------------------
