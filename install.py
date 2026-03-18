@@ -74,14 +74,14 @@ GLIBC_DEBS = [
 ]
 PATCHELF_URL = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz"
 
-# Ports ouverts : 25749 Auth, 25651 Master, 25690 Chat, 25631 World zone 1000
-# DFS formule : port = start + 1 + (instance_id * 3)
-# Zone 1000 instance 1 = 25627 + 1 + 3 = 25631
+# Ports disponibles : 4 ports seulement
+# Auth=25749, Master=25651, Chat=25690, World=25631
+# world_port_start = world_server_port pour forcer une seule instance sur le port connu
 DEFAULT_AUTH_PORT   = "25749"
 DEFAULT_MASTER_PORT = "25651"
 DEFAULT_CHAT_PORT   = "25690"
 DEFAULT_WORLD_PORT  = "25631"
-DEFAULT_WPS         = "25627"
+DEFAULT_WPS         = "25631"  # world_port_start = world_server_port, 1 seule instance
 
 
 # ---------------------------------------------------------------------------
@@ -758,8 +758,8 @@ def write_config(cfg):
     chat_port    = _cfg_get(cfg, "Networking", "chat_server_port",   DEFAULT_CHAT_PORT)
     master_port  = _cfg_get(cfg, "Networking", "master_server_port", DEFAULT_MASTER_PORT)
 
-    env_wps = os.environ.get("WORLD_PORT_START", "").strip()
-    world_port_start = env_wps if env_wps else DEFAULT_WPS
+    # world_port_start TOUJOURS égal à world_server_port pour rester sur le port assigné
+    world_port_start = world_port
 
     max_offline_time       = _cfg_get(cfg, "Gameplay", "max_offline_time",       "0")
     kick_after_failed_auth = _cfg_get(cfg, "Gameplay", "kick_after_failed_auth", "1")
@@ -776,7 +776,8 @@ def write_config(cfg):
     print(f"[=] auth_server_port   = {auth_port}")
     print(f"[=] master_server_port = {master_port}")
     print(f"[=] chat_server_port   = {chat_port}")
-    print(f"[=] world_port_start   = {world_port_start}")
+    print(f"[=] world_server_port  = {world_port}")
+    print(f"[=] world_port_start   = {world_port_start} (forcé = world_server_port)")
 
     if external_ip == "0.0.0.0":
         print("[!] ATTENTION : external_ip=0.0.0.0 — ajoutez EXTERNAL_IP dans Pterodactyl.")
@@ -817,6 +818,7 @@ def write_config(cfg):
         f"world_port_start={world_port_start}\n"
         f"chat_server_port={chat_port}\n"
         f"master_server_port={master_port}\n"
+        f"max_instances=1\n"
     )
 
     configs = {
